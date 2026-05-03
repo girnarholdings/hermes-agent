@@ -151,6 +151,33 @@ def _is_gateway_approval_context() -> bool:
         return True
     return bool(_get_session_platform())
 
+
+def _notify_approval_request_if_pending() -> None:
+    """Fire a /notify input-needed notification for approval prompts.
+
+    Best-effort only: approval safety flow must not depend on desktop
+    notification delivery. Do not clear the sentinel here; the final
+    turn-complete notification should still fire after the user responds.
+    """
+    try:
+        from tools.notify_utils import (
+            fire_approval_request_notification,
+            is_notify_pending,
+        )
+
+        # /notify is local CLI/TUI-only.  TUI gateway sessions set only a
+        # session key; messaging gateway sessions also set a platform.  Do not
+        # let a local sentinel trigger desktop notifications from Telegram,
+        # Discord, Slack, etc. approval flows.
+        if _get_session_platform():
+            return
+
+        if is_notify_pending():
+            fire_approval_request_notification()
+    except Exception as exc:
+        logger.debug("Approval-request notification failed: %s", exc)
+
+
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME, or by the resolved absolute
 # active profile home path such as /home/hermes/.hermes/config.yaml. The
@@ -1207,6 +1234,7 @@ def check_dangerous_command(command: str, env_type: str,
             "pattern_key": pattern_key,
             "description": description,
         })
+        _notify_approval_request_if_pending()
         return {
             "approved": False,
             "pattern_key": pattern_key,
@@ -1219,6 +1247,7 @@ def check_dangerous_command(command: str, env_type: str,
             ),
         }
 
+    _notify_approval_request_if_pending()
     choice = prompt_dangerous_approval(command, description,
                                        approval_callback=approval_callback)
 
@@ -1547,6 +1576,10 @@ def check_all_command_guards(command: str, env_type: str,
                     "pattern_key": primary_key,
                     "description": combined_desc,
                 }
+            # The approval prompt reached the user — surface a local /notify
+            # input-needed desktop notification if one is pending (no-op on
+            # messaging-gateway sessions, which carry a platform).
+            _notify_approval_request_if_pending()
             resolved = decision["resolved"]
             choice = decision["choice"]
 
@@ -1596,7 +1629,9 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_approved": True, "description": combined_desc}
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
-        # Return approval_required for backward compat.
+        # Return approval_required for backward compat.  Do not fire the local
+        # desktop /notify hook here because there is no local UI prompt to pair
+        # it with.
         submit_pending(session_key, {
             "command": command,
             "pattern_key": primary_key,
@@ -1626,6 +1661,7 @@ def check_all_command_guards(command: str, env_type: str,
         session_key=session_key,
         surface="cli",
     )
+    _notify_approval_request_if_pending()
     choice = prompt_dangerous_approval(command, combined_desc,
                                        allow_permanent=not has_tirith,
                                        approval_callback=approval_callback)

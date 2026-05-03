@@ -7137,6 +7137,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except Exception:
             return False
 
+    def _should_handle_notify_command_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True when /notify should be dispatched mid-task.
+
+        Same pattern as /steer: write the sentinel file without queuing
+        through _pending_input (which would miss the mid-run window).
+        """
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        if not getattr(self, "_agent_running", False):
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+            base = text.split(None, 1)[0].lower().lstrip('/')
+            cmd = resolve_command(base)
+            return bool(cmd and cmd.name == "notify")
+        except Exception:
+            return False
+
+    def _handle_notify_command(self, cmd_original: str):
+        """Handle /notify [prompt | cancel].
+
+        - /notify <prompt>  — set flag + submit prompt
+        - /notify           — set flag only (mid-task or pre-turn)
+        - /notify cancel    — clear pending notification
+        """
+        from tools.notify_utils import set_notify_flag, clear_notify_flag
+
+        parts = cmd_original.split(None, 1)
+        sub = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub.lower() == "cancel":
+            if clear_notify_flag():
+                _cprint("  🔕 Notification cancelled")
+            else:
+                _cprint("  No pending notification")
+            return
+
+        set_notify_flag()
+
+        if sub:
+            # Has a prompt — set flag AND submit
+            self._pending_input.put(sub)
+            _cprint(f"  🔔 Will notify when done: "
+                    f"{sub[:80]}{'...' if len(sub) > 80 else ''}")
+        else:
+            _cprint("  🔔 Will notify when this turn finishes")
+
     def _output_console(self):
         """Use prompt_toolkit-safe Rich rendering once the TUI is live."""
         if getattr(self, "_app", None):
@@ -7625,6 +7672,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                 else:
                     _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+        elif canonical == "notify":
+            self._handle_notify_command(cmd_original)
         elif canonical == "steer":
             # Inject a message after the next tool call without interrupting.
             # If the agent is actively running, push the text into the agent's
@@ -10389,6 +10438,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # Flush any remaining streamed text and close the box
             self._flush_stream()
 
+            # Notify check — fire if /notify was set for this turn.
+            # Must run BEFORE goal continuation so the notification
+            # reflects actual turn completion (mirrors the TUI path).
+            try:
+                from tools.notify_utils import (
+                    is_notify_pending,
+                    clear_notify_flag,
+                    fire_notification,
+                )
+                if is_notify_pending():
+                    clear_notify_flag()
+                    fire_notification()
+            except Exception as e:
+                logging.debug("notify idle-check failed: %s", e)
+
             # Signal end-of-text to TTS consumer and wait for it to finish
             if use_streaming_tts and text_queue is not None:
                 text_queue.put(None)  # sentinel
@@ -11277,6 +11341,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     # linger in the input area (looking unsent) and invite an
                     # accidental re-submit. See issue #34569.
                     event.app.invalidate()
+                    return
+
+                # Handle /notify while the agent is running — same pattern
+                # as /steer: write the sentinel file on the UI thread so it
+                # survives mid-run without queueing through _pending_input.
+                if self._should_handle_notify_command_inline(text, has_images=has_images):
+                    self.process_command(text)
+                    event.app.current_buffer.reset(append_to_history=True)
                     return
 
                 # Snapshot and clear attached images
@@ -13053,6 +13125,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         self._tool_start_time = 0.0
                         self._pending_tool_info.clear()
                         self._last_scrollback_tool = ""
+
+                        # Notify check — fire if /notify was set during this turn.
+                        # Must run BEFORE goal continuation so the notification
+                        # reflects the actual turn completion, not a
+                        # potentially-auto-continued turn.
+                        try:
+                            from tools.notify_utils import (
+                                is_notify_pending,
+                                clear_notify_flag,
+                                fire_notification,
+                            )
+                            if is_notify_pending():
+                                clear_notify_flag()
+                                fire_notification()
+                        except Exception as e:
+                            logging.debug("notify idle-check failed: %s", e)
 
                         app.invalidate()  # Refresh status line
 

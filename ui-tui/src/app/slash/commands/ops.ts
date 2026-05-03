@@ -63,6 +63,28 @@ interface SkillsReloadResponse {
 
 export const opsCommands: SlashCommand[] = [
   {
+    help: 'notify when this turn finishes; optionally submit a prompt',
+    name: 'notify',
+    run: (arg, ctx, cmd) => {
+      const trimmed = arg.trim()
+
+      ctx.gateway
+        .rpc<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: ctx.sid })
+        .then(
+          ctx.guarded<SlashExecResponse>(r => {
+            const body = r?.output || '/notify: no output'
+            ctx.transcript.sys(body)
+
+            if (trimmed && trimmed.toLowerCase() !== 'cancel') {
+              ctx.transcript.send(trimmed)
+            }
+          })
+        )
+        .catch(ctx.guardedErr)
+    }
+  },
+
+  {
     help: 'stop background processes',
     name: 'stop',
     run: (_arg, ctx) => {

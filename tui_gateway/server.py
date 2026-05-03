@@ -6330,6 +6330,22 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         file=sys.stderr,
                     )
 
+            # Notify check — fire if /notify was set for this turn.
+            # (The sentinel was set by the SlashWorker that handled the
+            # /notify command; the notification fires here after the
+            # agent's turn completes.)
+            try:
+                from tools.notify_utils import (
+                    is_notify_pending,
+                    clear_notify_flag,
+                    fire_notification,
+                )
+                if is_notify_pending():
+                    clear_notify_flag()
+                    fire_notification()
+            except Exception as e:
+                logging.debug("tui notify idle-check failed: %s", e)
+
             # Apply pending_title now that the DB row exists.
             _pending = session.get("pending_title")
             if _pending and status == "complete":
@@ -6410,6 +6426,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
             _emit("error", sid, {"message": str(e)})
+            # If /notify was set for this failed turn, consume it here too.
+            # Otherwise the global sentinel can leak into a later unrelated
+            # turn after the TUI error path exits.
+            try:
+                from tools.notify_utils import (
+                    is_notify_pending,
+                    clear_notify_flag,
+                    fire_notification,
+                )
+                if is_notify_pending():
+                    clear_notify_flag()
+                    fire_notification()
+            except Exception as notify_exc:
+                logging.debug("tui notify error-path check failed: %s", notify_exc)
         finally:
             try:
                 if approval_token is not None:
