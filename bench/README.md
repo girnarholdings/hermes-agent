@@ -50,7 +50,37 @@ shipped image) with the worktree bind-mounted read-only and `--memory=1g
 limit. See `run-e3.sh` if present, or the report's survival table for the exact
 invocation used.
 
-## Accounting + known deviations
+## What actually ran on 2026-06-11 (E1 host + E3-lite) — deviations from the plan
+
+- **3 reps** for mem3000 (not 5) and **scroll at 2000 msgs** (not 3000): the
+  OpenTUI engine on this tree (sha 197d499, dist built from 50e3471 tree state)
+  **crashes at ≈3000 fixture msgs** — an uncaught `Error: Failed to create
+  SyntaxStyle` (native handle allocation fails; every `TextBufferRenderable`
+  creates one in @opentui/core 0.4.0), masked by a second
+  `Failed to create optimized buffer` crash inside the renderer's
+  uncaughtException handler. Postmortems are in each result's `pty_tail`;
+  RSS at crash ≈880MB — far below the 2GB cap, so it is a handle/pool limit,
+  not memory. This dominates every OpenTUI cell past ~3000 msgs.
+- **OpenTUI headless node-count: not run.** `scripts/mem-bench.tsx` under Node
+  FFI dies on the first fixture turn with `ERR_INVALID_ARG_VALUE … 
+  textBufferViewSetViewport` (the known Bun→Node u32-coordinate class; the
+  production binary carries the ffiSafe clamp, the headless test renderer path
+  does not) and then hangs. The Ink fd-3 sampler ran fine.
+- **Startup real-gateway variant: probed, not run as a cell.** A full run would
+  forge real sessions in the user's `~/.hermes` store. Measured standalone:
+  the real `tui_gateway` (venv python) emits `gateway.ready` in **131ms median**
+  (×10, range 130–138ms) — add that to the fake-gateway startup numbers.
+- **No cgroup OOM kills observed** anywhere (Ink at 10k msgs peaks ~321MB;
+  OpenTUI crashes before reaching the cap), so the cap-hit machinery
+  (memory.events / journal fallback) never fired in anger; E3-lite classified
+  the OpenTUI death correctly as a crash (`oom_kill=0`, exit 7).
+- E2 (shipped Docker image): not run — image build time prohibitive in this
+  session; E3-lite (generic node:26) covers the constrained-memory question.
+- Drain-loop starvation: a handful of OpenTUI burst runs recorded 11–18ms max
+  event-loop lag in the harness (>10ms budget, flagged `drain_ok:false` in
+  those results); all paced/scroll/startup runs stayed under 10ms.
+
+## Accounting + known deviations (by design)
 
 - **"messages" = fixture rows** (`rowsPerTurn` accounting, identical to
   `ui-opentui/scripts/mem-bench.tsx`), so numbers are comparable with the

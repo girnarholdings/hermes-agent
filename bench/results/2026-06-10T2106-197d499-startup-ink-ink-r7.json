@@ -1,0 +1,157 @@
+{
+ "meta": {
+  "cell": "startup",
+  "ui": "ink",
+  "config": "ink",
+  "mode": "startup",
+  "rep": 7,
+  "run_id": "mq8k6fuy-8rey",
+  "utc": "2026-06-10T21:06:13.066Z",
+  "sha": "197d49948",
+  "node": "/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/node",
+  "node_version": "v26.3.0",
+  "pty": {
+   "cols": 120,
+   "rows": 40,
+   "term": "xterm-256color"
+  },
+  "heap_mb": 8192,
+  "memory_max": null,
+  "container_cap": false,
+  "container_memory": null,
+  "opentui_cap": null,
+  "fixture": {
+   "path": "",
+   "msgs": 0,
+   "sha256": ""
+  },
+  "sample_every": 100,
+  "mode_params": {},
+  "ui_pid": 2377249,
+  "gw_pid": 2377257,
+  "cgroup": null,
+  "load_avg_at_start": [
+   0.12,
+   0.36,
+   0.41
+  ],
+  "instrumented": false
+ },
+ "samples": [
+  {
+   "kind": "periodic",
+   "t_ms": 25,
+   "msgs": null,
+   "events": null,
+   "pty_bytes": 0,
+   "pty_writes": 0,
+   "rss_kb": 56048,
+   "pss_kb": 29799,
+   "private_dirty_kb": 18632,
+   "vmhwm_kb": 56104,
+   "utime_ticks": 1,
+   "stime_ticks": 0
+  },
+  {
+   "kind": "final",
+   "t_ms": 931,
+   "msgs": 0,
+   "events": 0,
+   "pty_bytes": 6604,
+   "pty_writes": 12,
+   "rss_kb": 108220,
+   "pss_kb": 68883,
+   "private_dirty_kb": 49072,
+   "vmhwm_kb": 108220,
+   "utime_ticks": 25,
+   "stime_ticks": 1
+  }
+ ],
+ "events": [
+  {
+   "kind": "rpc",
+   "method": "config.get",
+   "t_ms": 175
+  },
+  {
+   "kind": "rpc",
+   "method": "commands.catalog",
+   "t_ms": 200
+  },
+  {
+   "kind": "rpc",
+   "method": "config.get",
+   "t_ms": 200
+  },
+  {
+   "kind": "rpc",
+   "method": "setup.status",
+   "t_ms": 200
+  },
+  {
+   "kind": "rpc",
+   "method": "config.get",
+   "t_ms": 200
+  },
+  {
+   "kind": "rpc",
+   "method": "session.create",
+   "t_ms": 200
+  },
+  {
+   "kind": "rpc",
+   "method": "config.get",
+   "t_ms": 200
+  },
+  {
+   "kind": "rpc",
+   "method": "config.get",
+   "t_ms": 225
+  },
+  {
+   "kind": "rpc",
+   "method": "config.get",
+   "t_ms": 225
+  },
+  {
+   "kind": "rpc",
+   "method": "session.active_list",
+   "t_ms": 225
+  },
+  {
+   "kind": "rpc",
+   "method": "config.get",
+   "t_ms": 225
+  },
+  {
+   "kind": "rpc",
+   "method": "config.get",
+   "t_ms": 225
+  }
+ ],
+ "summary": {
+  "result": "completed",
+  "cap_hit": false,
+  "cap_hit_basis": null,
+  "at_messages": null,
+  "exit": {
+   "exitCode": 0,
+   "signal": 0,
+   "t": 941
+  },
+  "stream_done": false,
+  "msgs_streamed": 0,
+  "events_streamed": null,
+  "pty_bytes_total": 6785,
+  "pty_data_callbacks": 20,
+  "first_byte_ms": 67,
+  "session_create_ms": 200,
+  "stream_start_ms": null,
+  "vmhwm_kb": 108220,
+  "cg_peak": null,
+  "drain_max_loop_lag_ms": 2,
+  "drain_lag_violations": 0,
+  "drain_ok": true,
+  "digest": null
+ }
+}

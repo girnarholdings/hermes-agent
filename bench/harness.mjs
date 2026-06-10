@@ -224,6 +224,7 @@ export async function runScenario(opts) {
     nodeSampleFile = join(tmpdir(), `hermes-bench-nodes-${runId}.ndjson`)
     writeFileSync(nodeSampleFile, '')
     env.HERMES_TUI_MEMSAMPLE_FD = '3'
+    env.HERMES_TUI_MEMSAMPLE_MS = '200'
     const quoted = [file, ...args].map(a => `'${a.replace(/'/g, `'\\''`)}'`).join(' ')
     spawnFile = '/bin/sh'
     spawnArgs = ['-c', `exec 3>>'${nodeSampleFile}'; exec ${quoted}`]

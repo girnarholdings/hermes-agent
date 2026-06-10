@@ -103,11 +103,11 @@ function runPlateau(run) {
 const COLORS = { ink: '#e06c75', 'otui-capped': '#61afef', 'otui-uncapped': '#56b6c2', other: '#c678dd' }
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
-function chart({ title, w = 860, h = 420, xLabel, yLabel, xMax, yMax, series, capLine, markers = [], note }) {
+function chart({ title, w = 860, h = 440, xLabel, yLabel, xMax, yMax, series, capLine, markers = [], note }) {
   const padL = 64
   const padR = 16
   const padT = 40
-  const padB = 48
+  const padB = 64
   const pw = w - padL - padR
   const ph = h - padT - padB
   const X = x => padL + (x / xMax) * pw
@@ -131,7 +131,7 @@ function chart({ title, w = 860, h = 420, xLabel, yLabel, xMax, yMax, series, ca
     parts.push(`<line x1="${padL}" y1="${y}" x2="${padL + pw}" y2="${y}" stroke="#262c38" stroke-width="1"/>`)
     parts.push(`<text x="${padL - 8}" y="${y + 4}" fill="#8b93a7" font-size="11" text-anchor="end">${Math.round(yv)}</text>`)
   }
-  parts.push(`<text x="${padL + pw / 2}" y="${h - 10}" fill="#aab2c5" font-size="12" text-anchor="middle">${esc(xLabel)}</text>`)
+  parts.push(`<text x="${padL + pw / 2}" y="${h - 26}" fill="#aab2c5" font-size="12" text-anchor="middle">${esc(xLabel)}</text>`)
   parts.push(
     `<text x="16" y="${padT + ph / 2}" fill="#aab2c5" font-size="12" text-anchor="middle" transform="rotate(-90 16 ${padT + ph / 2})">${esc(yLabel)}</text>`
   )
@@ -158,7 +158,7 @@ function chart({ title, w = 860, h = 420, xLabel, yLabel, xMax, yMax, series, ca
     parts.push(`<text x="${x}" y="${y + 5}" fill="${m.color ?? '#e5c07b'}" font-size="16" text-anchor="middle" font-weight="bold">×</text>`)
     if (m.label) parts.push(`<text x="${x}" y="${y - 10}" fill="${m.color ?? '#e5c07b'}" font-size="10" text-anchor="middle">${esc(m.label)}</text>`)
   }
-  if (note) parts.push(`<text x="${padL}" y="${h - 28}" fill="#6f7689" font-size="10">${esc(note)}</text>`)
+  if (note) parts.push(`<text x="${padL}" y="${h - 8}" fill="#6f7689" font-size="10">${esc(note)}</text>`)
   parts.push('</svg>')
   return parts.join('\n')
 }
@@ -231,6 +231,9 @@ function rssChart(results) {
     if (r.summary.cap_hit) {
       const last = pts[pts.length - 1]
       markers.push({ x: last[0], y: last[1], label: `OOM @${last[0]}`, color: '#e5c07b' })
+    } else if (r.summary.result === 'died' || r.summary.result === 'crashed_after_stream') {
+      const last = pts[pts.length - 1]
+      markers.push({ x: last[0], y: last[1], label: `crash @${last[0]}`, color: '#e06c75' })
     }
   }
   return chart({
@@ -297,6 +300,7 @@ function nodesChart(results) {
 function scrollCdfChart(results) {
   const runs = results.filter(r => r.meta.cell.startsWith('scroll') && r.summary.scroll_latencies_ms?.length)
   if (!runs.length) return null
+  const transcriptMsgs = runs[0].meta.fixture?.msgs ?? '?'
   const byConfig = {}
   for (const r of runs) {
     ;(byConfig[r.meta.config] ??= []).push(...r.summary.scroll_latencies_ms)
@@ -310,7 +314,7 @@ function scrollCdfChart(results) {
     series.push({ points: pts, color: COLORS[config] ?? COLORS.other, label: `${config} (n=${s.length})` })
   }
   return chart({
-    title: 'Scroll latency CDF — SGR wheel 30Hz×15s on 3000-msg transcript (all reps pooled)',
+    title: `Scroll latency CDF — SGR wheel 30Hz×15s on ${transcriptMsgs}-msg transcript (all reps pooled)`,
     xLabel: 'write → first output byte (ms)',
     yLabel: 'percentile (%)',
     xMax: Math.max(1, xMax),

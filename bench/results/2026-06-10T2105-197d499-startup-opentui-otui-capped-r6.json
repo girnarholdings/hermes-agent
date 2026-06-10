@@ -1,0 +1,126 @@
+{
+ "meta": {
+  "cell": "startup",
+  "ui": "opentui",
+  "config": "otui-capped",
+  "mode": "startup",
+  "rep": 6,
+  "run_id": "mq8k5pso-h4fq",
+  "utc": "2026-06-10T21:05:39.288Z",
+  "sha": "197d49948",
+  "node": "/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/node",
+  "node_version": "v26.3.0",
+  "pty": {
+   "cols": 120,
+   "rows": 40,
+   "term": "xterm-256color"
+  },
+  "heap_mb": 8192,
+  "memory_max": null,
+  "container_cap": false,
+  "container_memory": null,
+  "opentui_cap": 3000,
+  "fixture": {
+   "path": "",
+   "msgs": 0,
+   "sha256": ""
+  },
+  "sample_every": 100,
+  "mode_params": {},
+  "ui_pid": 2376514,
+  "gw_pid": 2376524,
+  "cgroup": null,
+  "load_avg_at_start": [
+   0.11,
+   0.39,
+   0.42
+  ],
+  "instrumented": false
+ },
+ "samples": [
+  {
+   "kind": "periodic",
+   "t_ms": 27,
+   "msgs": null,
+   "events": null,
+   "pty_bytes": 0,
+   "pty_writes": 0,
+   "rss_kb": 55236,
+   "pss_kb": 28896,
+   "private_dirty_kb": 17788,
+   "vmhwm_kb": 55268,
+   "utime_ticks": 2,
+   "stime_ticks": 0
+  },
+  {
+   "kind": "periodic",
+   "t_ms": 1035,
+   "msgs": null,
+   "events": null,
+   "pty_bytes": 28911,
+   "pty_writes": 15,
+   "rss_kb": 104964,
+   "pss_kb": 64795,
+   "private_dirty_kb": 48240,
+   "vmhwm_kb": 107208,
+   "utime_ticks": 17,
+   "stime_ticks": 2
+  },
+  {
+   "kind": "final",
+   "t_ms": 1138,
+   "msgs": 0,
+   "events": 0,
+   "pty_bytes": 28911,
+   "pty_writes": 15,
+   "rss_kb": 104964,
+   "pss_kb": 64795,
+   "private_dirty_kb": 48240,
+   "vmhwm_kb": 107208,
+   "utime_ticks": 17,
+   "stime_ticks": 2
+  }
+ ],
+ "events": [
+  {
+   "kind": "rpc",
+   "method": "session.create",
+   "t_ms": 175
+  },
+  {
+   "kind": "rpc",
+   "method": "startup.catalog",
+   "t_ms": 175
+  },
+  {
+   "kind": "rpc",
+   "method": "model.options",
+   "t_ms": 175
+  }
+ ],
+ "summary": {
+  "result": "completed",
+  "cap_hit": false,
+  "cap_hit_basis": null,
+  "at_messages": null,
+  "exit": {
+   "exitCode": 0,
+   "signal": 0,
+   "t": 1320
+  },
+  "stream_done": false,
+  "msgs_streamed": 0,
+  "events_streamed": null,
+  "pty_bytes_total": 29189,
+  "pty_data_callbacks": 19,
+  "first_byte_ms": 124,
+  "session_create_ms": 175,
+  "stream_start_ms": null,
+  "vmhwm_kb": 107208,
+  "cg_peak": null,
+  "drain_max_loop_lag_ms": 2,
+  "drain_lag_violations": 0,
+  "drain_ok": true,
+  "digest": null
+ }
+}
