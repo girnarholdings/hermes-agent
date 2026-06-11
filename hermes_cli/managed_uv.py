@@ -252,28 +252,33 @@ def _install_uv_windows(env: dict[str, str]) -> None:
     )
 
 def get_pip_cmd() -> list[str]:
-    """Return the preferred pip command prefix.
+    """Return the authoritative pip command prefix.
     
-    Hermes manages its own uv binary. This returns the managed uv pip command
-    prefix (e.g., `["/path/to/managed/uv", "pip"]`). 
-    
+    Hermes strictly requires `uv` for dependency management. 
     Fallback hierarchy:
-    1. Managed uv at `$HERMES_HOME/bin/uv` (guaranteed on supported platforms).
-    2. System/PATH `uv` (e.g., Termux fallback via `pip install uv`).
-    3. `[sys.executable, "-m", "pip"]` (degenerate fallback only).
+    1. Managed uv at `$HERMES_HOME/bin/uv` (guaranteed by `ensure_uv()`).
+    2. System/PATH `uv` (e.g., Termux `pkg install uv`, Homebrew, etc.).
+    
+    If neither is found, this raises a RuntimeError. We NEVER fall back to 
+    raw `[sys.executable, "-m", "pip"]`, as that re-introduces the 
+    ensurepip/PEP-668/venv-contamination bugs this architecture was built to eliminate.
     """
     uv_bin = resolve_uv()
     if uv_bin:
         return [uv_bin, "pip"]
     
-    # Secondary fallback: check PATH for uv (critical for Termux compatibility
-    # where the official installer may fail due to glibc vs bionic differences).
+    # Secondary fallback: check PATH for uv (critical for Termux `pkg install uv` support)
     path_uv = shutil.which("uv")
     if path_uv:
         return [path_uv, "pip"]
         
-    # Degenerate fallback for environments where uv is genuinely absent
-    return [sys.executable, "-m", "pip"]
+    # HARD FAIL: uv is a strict requirement. Do not silently degrade to raw pip.
+    raise RuntimeError(
+        "uv is not installed or not found in PATH. "
+        "Hermes strictly requires uv for dependency management. "
+        "Please install uv (e.g., via the Hermes installer, `pkg install uv` on Termux, "
+        "or https://docs.astral.sh/uv/getting-started/installation/) and try again."
+    )
 
 
 def get_venv_root() -> Path:
