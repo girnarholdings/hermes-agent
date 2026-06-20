@@ -352,3 +352,33 @@ jobs:
         shell: pwsh
         run: |
           Get-Content ahk.log
+
+      - name: Find latest screenshot (Windows Screenshots folder)
+        if: always()
+        id: latest
+        shell: pwsh
+        run: |
+          $folder = "$env:USERPROFILE\Pictures\Screenshots"
+
+          if (!(Test-Path $folder)) {
+            Write-Error "Screenshots folder not found: $folder"
+            exit 1
+          }
+
+          $files = Get-ChildItem -Path $folder -Filter "*.png" -File |
+                   Sort-Object LastWriteTime -Descending
+
+          if (-not $files) {
+            Write-Error "No screenshots found"
+            exit 1
+          }
+
+          $latest = $files[0].FullName
+          echo "file=$latest" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-screenshot
+          path: ${{ steps.latest.outputs.file }}
