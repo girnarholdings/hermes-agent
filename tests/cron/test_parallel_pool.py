@@ -83,7 +83,7 @@ class TestRunningJobGuard:
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "run_job", lambda j: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -116,7 +116,7 @@ class TestSyncMode:
         ]
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "run_job", lambda j: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -152,7 +152,7 @@ class TestSyncMode:
             return True, "out", "resp", None
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "run_job", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -206,7 +206,7 @@ class TestSequentialPool:
             return True, "out", "resp", None
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "run_job", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
@@ -248,7 +248,7 @@ class TestSequentialPool:
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
         monkeypatch.setattr(sched, "run_job", lambda j: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
