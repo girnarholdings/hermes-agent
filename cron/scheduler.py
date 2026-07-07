@@ -236,7 +236,12 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+    claim_job_for_fire,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2869,13 +2874,30 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
+        # Claim each due job FIRST, under the jobs file lock, before any
+        # execution begins — the same store-level CAS the external fire_due
+        # path uses. This does two things atomically per job:
+        #   1. advances next_run_at for recurring jobs (the historical
+        #      advance_next_run bump — preserves at-most-once semantics across
+        #      a crash mid-execution), and
+        #   2. stamps a fire_claim, so a SECOND scheduler process sharing this
+        #      home (manual `hermes cron tick`, standalone daemon, --force
+        #      gateway) can't re-fire a still-running job. The .tick.lock
+        #      alone doesn't cover that window: it's released right after
+        #      async dispatch, and a one-shot's next_run_at is only cleared
+        #      by mark_job_run on completion.
+        # mark_job_run() clears the claim and re-anchors next_run_at on
+        # completion. A lost claim means another process won this fire.
+        claimed_jobs = []
         for job in due_jobs:
-            advance_next_run(job["id"])
+            if claim_job_for_fire(job["id"]):
+                claimed_jobs.append(job)
+            else:
+                logger.info(
+                    "Job '%s' fire already claimed by another scheduler — skipping",
+                    job.get("name", job["id"]),
+                )
+        due_jobs = claimed_jobs
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.

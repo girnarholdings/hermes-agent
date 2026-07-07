@@ -74,6 +74,11 @@ _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+# How long a ``fire_claim`` stamp blocks a duplicate fire of the same job.
+# Shared by claim_job_for_fire() (the store-level CAS) and the due-job scan,
+# so a second scheduler process sharing this home can't re-fire a job whose
+# claim is still fresh. A crashed claimer is unwedged after the TTL.
+FIRE_CLAIM_TTL_SECONDS = 300
 
 
 def _jobs_lock_file() -> Path:
@@ -1292,7 +1297,25 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+def _has_fresh_fire_claim(job: Dict[str, Any], now: datetime,
+                          ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS) -> bool:
+    """True if ``job`` carries a ``fire_claim`` younger than ``ttl_seconds``.
+
+    A malformed or unparseable claim is treated as absent (matching
+    ``claim_job_for_fire``'s overwrite behaviour) so a corrupt stamp can never
+    wedge a job.
+    """
+    claim = job.get("fire_claim")
+    if not claim:
+        return False
+    try:
+        claimed_at = _ensure_aware(datetime.fromisoformat(claim["at"]))
+    except Exception:
+        return False  # malformed claim → treat as absent
+    return (now - claimed_at).total_seconds() < ttl_seconds
+
+
+def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
@@ -1321,14 +1344,8 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
             now = _hermes_now()
-            existing = job.get("fire_claim")
-            if existing:
-                try:
-                    claimed_at = _ensure_aware(datetime.fromisoformat(existing["at"]))
-                    if (now - claimed_at).total_seconds() < claim_ttl_seconds:
-                        return False  # someone holds a fresh claim
-                except Exception:
-                    pass  # malformed claim → overwrite
+            if _has_fresh_fire_claim(job, now, claim_ttl_seconds):
+                return False  # someone holds a fresh claim
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
@@ -1368,6 +1385,23 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
     for job in jobs:
         if not job.get("enabled", True):
+            continue
+
+        # A fresh fire_claim means another scheduler sharing this home (the
+        # gateway's own tick dispatch, a manual `hermes cron tick`, a
+        # standalone daemon, or an external fire_due) has claimed this fire
+        # and may still be running it. Skip it — the .tick.lock alone does
+        # not cover this window because it is released right after async
+        # dispatch, and a one-shot's next_run_at is only cleared by
+        # mark_job_run on completion, so a second process would otherwise
+        # re-fire a still-running one-shot. mark_job_run clears the claim;
+        # a crashed claimer expires after FIRE_CLAIM_TTL_SECONDS.
+        if _has_fresh_fire_claim(job, now):
+            logger.debug(
+                "Job '%s' holds a fresh fire_claim (%s) — not due",
+                job.get("name", job["id"]),
+                job.get("fire_claim"),
+            )
             continue
 
         next_run = job.get("next_run_at")
@@ -1410,9 +1444,39 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     needs_save = True
                     break
 
-        raw_next_run_dt = datetime.fromisoformat(next_run)
         schedule = job.get("schedule", {})
         kind = schedule.get("kind")
+
+        try:
+            raw_next_run_dt = datetime.fromisoformat(next_run)
+        except (TypeError, ValueError):
+            # One malformed timestamp must not halt the WHOLE scheduler: an
+            # unguarded parse error here used to raise out of the tick and
+            # silently stop every other job from firing. Repair this job
+            # (recompute like the missing-next_run_at branch above) and
+            # move on.
+            recovered = _recoverable_oneshot_run_at(
+                schedule, now, last_run_at=job.get("last_run_at"),
+            )
+            if not recovered and kind in {"cron", "interval"}:
+                recovered = compute_next_run(schedule, now.isoformat())
+            logger.error(
+                "Job '%s' (%s) has malformed next_run_at %r — skipping this "
+                "tick and rescheduling to %s",
+                job.get("name", job["id"]),
+                job["id"],
+                next_run,
+                recovered,
+            )
+            # Persist even a None recovery so the malformed value is cleared
+            # (a None one-shot stays parked instead of re-logging every tick;
+            # recurring kinds always recompute a real time above).
+            for rj in raw_jobs:
+                if rj["id"] == job["id"]:
+                    rj["next_run_at"] = recovered
+                    needs_save = True
+                    break
+            continue
 
         next_run_dt = _ensure_aware(raw_next_run_dt)
         # Migration repair: a cron job persists next_run_at as an absolute
@@ -1453,6 +1517,45 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         break
                 continue
 
+        # Consistency check: a cron job must only fire on an instant its
+        # schedule.expr actually describes. A stored next_run_at that is NOT
+        # an occurrence of the expr (hand-edited jobs.json, an expr change
+        # that bypassed update_job, or plain corruption) would otherwise fire
+        # at a time the schedule never asked for. Validate before firing; on
+        # mismatch, skip the bogus fire and reschedule to the expr's real
+        # next occurrence. Interval/once jobs have no expr and are untouched.
+        expr = schedule.get("expr")
+        if kind == "cron" and expr and HAS_CRONITER and next_run_dt <= now:
+            try:
+                # Validate against the RAW stored value: the expr describes
+                # wall-clock intent in the timezone the instant was persisted
+                # with, and _ensure_aware's conversion to the configured tz
+                # would shift the wall clock (a valid 09:00+10 occurrence must
+                # not be misread as 01:00+02 after a tz migration).
+                expr_matches = croniter.match(expr, raw_next_run_dt)
+            except Exception:
+                # Unvalidatable expr — don't block the fire on a checker error.
+                expr_matches = True
+            if not expr_matches:
+                new_next = compute_next_run(schedule, now.isoformat())
+                logger.error(
+                    "Job '%s' (%s): stored next_run_at %s is NOT an occurrence "
+                    "of cron expr %r — refusing this fire and rescheduling to "
+                    "%s",
+                    job.get("name", job["id"]),
+                    job["id"],
+                    next_run,
+                    expr,
+                    new_next,
+                )
+                if new_next:
+                    for rj in raw_jobs:
+                        if rj["id"] == job["id"]:
+                            rj["next_run_at"] = new_next
+                            needs_save = True
+                            break
+                continue
+
         if next_run_dt <= now:
 
             # For recurring jobs, check if the scheduled time is stale
@@ -1476,12 +1579,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     )
                     # Persist the fast-forward to storage now (skip accumulated
                     # slots). In the built-in ticker path this is shortly
-                    # overwritten by advance_next_run + mark_job_run, but it is
-                    # NOT redundant: it (a) protects the crash window between
-                    # here and mark_job_run, and (b) covers the external
-                    # fire_due provider path, which does not call
-                    # advance_next_run. mark_job_run re-anchors next_run_at off
-                    # the actual completion time, so this value is provisional.
+                    # overwritten by claim_job_for_fire's bump + mark_job_run,
+                    # but it is NOT redundant: it protects the crash window
+                    # between here and mark_job_run. mark_job_run re-anchors
+                    # next_run_at off the actual completion time, so this
+                    # value is provisional.
                     for rj in raw_jobs:
                         if rj["id"] == job["id"]:
                             rj["next_run_at"] = new_next
