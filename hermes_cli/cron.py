@@ -363,8 +363,8 @@ def cron_edit(args):
     return 0
 
 
-def _job_action(action: str, job_id: str, success_verb: str) -> int:
-    result = _cron_api(action=action, job_id=job_id)
+def _job_action(action: str, job_id: str, success_verb: str, **kwargs) -> int:
+    result = _cron_api(action=action, job_id=job_id, **kwargs)
     if not result.get("success"):
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
@@ -414,7 +414,9 @@ def cron_command(args):
         return _job_action("resume", args.job_id, "Resumed")
 
     if subcmd == "run":
-        return _job_action("run", args.job_id, "Triggered")
+        # Tag the fire so the output header / last_trigger reads "cli" — a
+        # `hermes cron run` must never be mistaken for a scheduled fire.
+        return _job_action("run", args.job_id, "Triggered", trigger_source="cli")
 
     if subcmd in {"remove", "rm", "delete"}:
         return _job_action("remove", args.job_id, "Removed")

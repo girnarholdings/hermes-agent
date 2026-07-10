@@ -484,6 +484,45 @@ class TestResolveJobRef:
             remove_job("dup")
 
 
+class TestTriggerJob:
+    def test_trigger_stashes_pending_slot(self, tmp_cron_dir):
+        # trigger_job overwrites next_run_at with "now" so the ticker fires the
+        # job; the real pending slot must be stashed for restore-on-completion.
+        from cron.jobs import trigger_job
+        job = create_job(prompt="A", schedule="every 2h")
+        original_slot = get_job(job["id"])["next_run_at"]
+
+        triggered = trigger_job(job["id"])
+
+        assert triggered["trigger_source"] == "manual"
+        assert triggered["scheduled_next_run_at"] == original_slot
+        assert triggered["next_run_at"] != original_slot
+
+    def test_double_trigger_keeps_original_stash(self, tmp_cron_dir):
+        # A second run-now before the first fires must not overwrite the stash
+        # with the first trigger's "now" — the real slot would be lost.
+        from cron.jobs import trigger_job
+        job = create_job(prompt="A", schedule="every 2h")
+        original_slot = get_job(job["id"])["next_run_at"]
+
+        trigger_job(job["id"])
+        second = trigger_job(job["id"])
+
+        assert second["scheduled_next_run_at"] == original_slot
+
+    def test_trigger_source_recorded(self, tmp_cron_dir):
+        from cron.jobs import trigger_job
+        job = create_job(prompt="A", schedule="every 1h")
+        assert trigger_job(job["id"], source="api")["trigger_source"] == "api"
+
+    def test_unknown_trigger_source_falls_back_to_manual(self, tmp_cron_dir):
+        # trigger_source ends up in the persisted store and the output header —
+        # clamp unexpected values to the known set.
+        from cron.jobs import trigger_job
+        job = create_job(prompt="A", schedule="every 1h")
+        assert trigger_job(job["id"], source="weird")["trigger_source"] == "manual"
+
+
 class TestMarkJobRun:
     def test_increments_completed(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="every 1h")
@@ -527,6 +566,81 @@ class TestMarkJobRun:
         update_job(job["id"], {"trigger_source": "manual"})
         mark_job_run(job["id"], success=True, trigger="manual")
         assert "trigger_source" not in get_job(job["id"])
+
+    def test_manual_run_restores_stashed_slot(self, tmp_cron_dir):
+        # A triggered (out-of-band) run must restore the pre-trigger scheduled
+        # slot instead of re-anchoring the schedule at the completion time —
+        # the perturbation that made manual re-runs shift interval schedules
+        # (2026-07-09 BetNews incident).
+        from cron.jobs import trigger_job
+        job = create_job(prompt="Test", schedule="every 2h")
+        original_slot = get_job(job["id"])["next_run_at"]
+
+        trigger_job(job["id"])
+        mark_job_run(job["id"], success=True, trigger="manual")
+
+        updated = get_job(job["id"])
+        assert updated["next_run_at"] == original_slot
+        assert "scheduled_next_run_at" not in updated
+        assert updated["state"] == "scheduled"
+
+    def test_manual_run_without_stash_leaves_next_run_alone(self, tmp_cron_dir):
+        # The run-now path (claim_job_for_fire scheduled=False) never moves
+        # next_run_at and stashes nothing — mark_job_run must leave the pending
+        # slot exactly where it was.
+        job = create_job(prompt="Test", schedule="every 2h")
+        original_slot = get_job(job["id"])["next_run_at"]
+        mark_job_run(job["id"], success=True, trigger="manual")
+        assert get_job(job["id"])["next_run_at"] == original_slot
+
+    def test_scheduled_run_clears_stale_stash_and_recomputes(self, tmp_cron_dir):
+        # A scheduled fire recomputes next_run_at as before and cleans up any
+        # leftover stash so it can't be restored later by mistake.
+        job = create_job(prompt="Test", schedule="every 1h")
+        update_job(job["id"], {"scheduled_next_run_at": "2020-01-01T00:00:00"})
+        mark_job_run(job["id"], success=True)
+        updated = get_job(job["id"])
+        assert "scheduled_next_run_at" not in updated
+        assert updated["next_run_at"] != "2020-01-01T00:00:00"
+
+    def test_full_manual_fire_cycle_preserves_schedule(self, tmp_cron_dir):
+        # The real ticker sequence for a triggered job: trigger_job (slot
+        # stashed, next_run_at=now) → get_due_jobs (due, manual-exempt) →
+        # advance_next_run (crash guard re-anchors at now) → mark_job_run
+        # (manual). The original slot must survive the whole cycle.
+        from cron.jobs import trigger_job
+        job = create_job(prompt="Cycle", schedule="every 2h")
+        original_slot = get_job(job["id"])["next_run_at"]
+
+        trigger_job(job["id"])
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == [job["id"]]
+        assert due[0]["trigger_source"] == "manual"
+        advance_next_run(job["id"])
+        mark_job_run(job["id"], success=True, trigger="manual")
+
+        updated = get_job(job["id"])
+        assert updated["next_run_at"] == original_slot
+        assert updated["repeat"]["completed"] == 0
+        assert updated["last_trigger"] == "manual"
+
+    def test_manual_run_of_pending_oneshot_keeps_the_oneshot(self, tmp_cron_dir):
+        # Manually running a one-shot BEFORE its scheduled time must not
+        # consume it: the stashed once-slot is restored and the job stays
+        # scheduled instead of being marked completed.
+        from cron.jobs import trigger_job
+        run_at = (datetime.now() + timedelta(hours=3)).replace(microsecond=0)
+        job = create_job(prompt="Once", schedule=run_at.isoformat())
+        original_slot = get_job(job["id"])["next_run_at"]
+
+        trigger_job(job["id"])
+        mark_job_run(job["id"], success=True, trigger="manual")
+
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["next_run_at"] == original_slot
+        assert updated["enabled"] is True
+        assert updated["state"] == "scheduled"
 
     def test_repeat_negative_one_is_infinite(self, tmp_cron_dir):
         # LLMs often pass repeat=-1 to mean "infinite/forever".
@@ -765,6 +879,54 @@ class TestGetDueJobs:
         due = get_due_jobs()
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
+
+    def test_dispatch_records_fired_slot(self, tmp_cron_dir):
+        """Returning a recurring job as due records the consumed slot
+        (last_fired_slot) so the same occurrence can't be dispatched twice."""
+        job = create_job(prompt="Due now", schedule="every 1h")
+        jobs = load_jobs()
+        slot = (datetime.now() - timedelta(minutes=10)).isoformat()
+        jobs[0]["next_run_at"] = slot
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == [job["id"]]
+        assert get_job(job["id"])["last_fired_slot"] == slot
+
+    def test_already_fired_slot_is_suppressed_and_fast_forwarded(self, tmp_cron_dir):
+        """Occurrence-level idempotency: if next_run_at still holds a slot that
+        was already dispatched (e.g. jobs.json restored from a backup taken
+        after dispatch), the duplicate fire is suppressed and next_run_at
+        fast-forwarded to the next future occurrence."""
+        from cron.jobs import _ensure_aware, _hermes_now
+        job = create_job(prompt="Dup", schedule="every 1h")
+        jobs = load_jobs()
+        slot = (datetime.now() - timedelta(minutes=10)).isoformat()
+        jobs[0]["next_run_at"] = slot
+        jobs[0]["last_fired_slot"] = slot
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert due == []
+        nxt = _ensure_aware(datetime.fromisoformat(get_job(job["id"])["next_run_at"]))
+        assert nxt > _hermes_now()
+
+    def test_manual_fire_ignores_fired_slot_suppression(self, tmp_cron_dir):
+        """A pending manual trigger (trigger_source set, next_run_at='now') is
+        not a real slot — it must fire even if it string-matches
+        last_fired_slot, and must not overwrite the recorded slot."""
+        job = create_job(prompt="Manual", schedule="every 1h")
+        jobs = load_jobs()
+        slot = (datetime.now() - timedelta(minutes=1)).isoformat()
+        jobs[0]["next_run_at"] = slot
+        jobs[0]["last_fired_slot"] = slot
+        jobs[0]["trigger_source"] = "manual"
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == [job["id"]]
+        # The manual pseudo-slot is not recorded as a fired occurrence.
+        assert get_job(job["id"])["last_fired_slot"] == slot
 
     def test_stale_past_due_runs_once_and_fast_forwards(self, tmp_cron_dir):
         """Recurring jobs past their grace window run once now and fast-forward next_run_at.

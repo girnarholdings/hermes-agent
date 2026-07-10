@@ -96,14 +96,17 @@ def test_manual_trigger_is_tagged_and_excluded_from_repeat_budget(monkeypatch):
     assert ok is True
     assert marked["trigger"] == "manual"
     assert "**Trigger:** manual" in saved["out"]
-    # header line inserted immediately before Run Time, once
+    assert "**Fired:**" in saved["out"]
+    # header lines inserted immediately before Run Time, once
     assert saved["out"].count("**Trigger:**") == 1
+    assert saved["out"].count("**Fired:**") == 1
 
 
-def test_scheduled_fire_is_untagged(monkeypatch):
-    """A normal scheduled fire (no trigger_source) leaves the output header
-    unchanged and reports trigger='scheduled' — byte-identical to pre-change
-    behavior for the common path."""
+def test_scheduled_fire_is_tagged_scheduled(monkeypatch):
+    """A normal scheduled fire (no trigger_source) is explicitly tagged
+    **Trigger:** scheduled with its FIRE time (the body's **Run Time:** is a
+    completion stamp) and reports trigger='scheduled' to mark_job_run — every
+    saved output declares how and when it was initiated."""
     saved = {}
     marked = {}
     monkeypatch.setattr(
@@ -125,7 +128,9 @@ def test_scheduled_fire_is_untagged(monkeypatch):
     s.run_one_job({"id": "js", "name": "t"})
 
     assert marked["trigger"] == "scheduled"
-    assert "**Trigger:**" not in saved["out"]
+    assert "**Trigger:** scheduled" in saved["out"]
+    assert "**Fired:**" in saved["out"]
+    assert saved["out"].count("**Trigger:**") == 1
 
 
 def test_run_one_job_silent_skips_delivery(monkeypatch):

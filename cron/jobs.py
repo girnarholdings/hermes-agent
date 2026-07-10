@@ -1130,28 +1130,44 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
+# How an out-of-band fire was initiated. "scheduled" is reserved for the
+# ticker firing a job at its own cron/interval time and is never a valid
+# *trigger_source* value — its absence means scheduled.
+VALID_TRIGGER_SOURCES = frozenset({"manual", "cli", "api"})
+
+
+def trigger_job(job_id: str, source: str = "manual") -> Optional[Dict[str, Any]]:
     """Schedule a job to run on the next scheduler tick. Accepts a job ID or name.
 
-    Marks the fire as ``trigger_source="manual"`` so the ticker records it as a
-    manual run (tagged in the output header, excluded from the repeat budget)
-    rather than an indistinguishable scheduled fire. The marker is cleared by
-    ``mark_job_run`` once the run completes.
+    Marks the fire as ``trigger_source=<source>`` ("manual" for operator/agent
+    run-nows, "cli" for ``hermes cron run``, "api" for the REST endpoints) so
+    the ticker records it as an out-of-band run (tagged in the output header,
+    excluded from the repeat budget) rather than an indistinguishable scheduled
+    fire. The marker is cleared by ``mark_job_run`` once the run completes.
+
+    The job's pending scheduled slot is stashed as ``scheduled_next_run_at``
+    before ``next_run_at`` is overwritten with "now"; ``mark_job_run`` restores
+    it on completion so a manual run does not consume or re-phase the schedule.
     """
+    if source not in VALID_TRIGGER_SOURCES:
+        source = "manual"
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    return update_job(
-        job["id"],
-        {
-            "enabled": True,
-            "state": "scheduled",
-            "paused_at": None,
-            "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
-            "trigger_source": "manual",
-        },
-    )
+    updates = {
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "next_run_at": _hermes_now().isoformat(),
+        "trigger_source": source,
+    }
+    # Stash the real pending slot for restore-on-completion — but only if no
+    # trigger is already pending, so a second run-now issued before the first
+    # fires can't overwrite the stash with the first trigger's "now".
+    if not job.get("trigger_source"):
+        updates["scheduled_next_run_at"] = job.get("next_run_at")
+    return update_job(job["id"], updates)
 
 
 def remove_job(job_id: str) -> bool:
@@ -1231,8 +1247,23 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Compute next run. A manual fire must not re-phase the
+                # schedule (re-anchoring an interval at the completion time
+                # shifts every subsequent slot): restore the pre-trigger slot
+                # stashed by trigger_job instead. The run-now path
+                # (claim_job_for_fire with scheduled=False) never moved
+                # next_run_at, so no stash means leave it alone.
+                if manual:
+                    if "scheduled_next_run_at" in job:
+                        restored = job.pop("scheduled_next_run_at")
+                        if restored is None and job.get("schedule", {}).get("kind") in {"cron", "interval"}:
+                            # Recurring job had no pending slot when triggered
+                            # (unusual) — compute one so it isn't wedged.
+                            restored = compute_next_run(job["schedule"], now)
+                        job["next_run_at"] = restored
+                else:
+                    job.pop("scheduled_next_run_at", None)
+                    job["next_run_at"] = compute_next_run(job["schedule"], now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -1240,7 +1271,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # Recurring jobs must NEVER be silently disabled: that turns a
                 # missing runtime dep into "job completed" and the user's
                 # schedule quietly goes off. See issue #16265.
-                if job["next_run_at"] is None:
+                if job.get("next_run_at") is None:
                     kind = job.get("schedule", {}).get("kind")
                     if kind in {"cron", "interval"}:
                         job["state"] = "error"
@@ -1315,7 +1346,8 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300,
+                       scheduled: bool = True) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
@@ -1335,6 +1367,12 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
     reclaim it.
+
+    ``scheduled=False`` marks a manual run-now claim (agent ``cronjob run`` /
+    ``hermes cron run``): the pending FUTURE slot is left untouched so the
+    out-of-band run doesn't re-phase the schedule. next_run_at is still
+    advanced when the slot is already due, so a run-now landing exactly on the
+    slot can't double-fire with a racing tick.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1355,9 +1393,20 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
-                nxt = compute_next_run(job["schedule"], now.isoformat())
-                if nxt:
-                    job["next_run_at"] = nxt
+                advance = scheduled
+                if not scheduled:
+                    # Manual run-now: keep the pending future slot untouched.
+                    # Advance only when the slot is already due (see docstring).
+                    nra = job.get("next_run_at")
+                    try:
+                        advance = bool(nra) and _ensure_aware(
+                            datetime.fromisoformat(nra)) <= now
+                    except (ValueError, TypeError):
+                        advance = True
+                if advance:
+                    nxt = compute_next_run(job["schedule"], now.isoformat())
+                    if nxt:
+                        job["next_run_at"] = nxt
             save_jobs(jobs)
             return True
         return False
@@ -1478,6 +1527,35 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
         if next_run_dt <= now:
 
+            # Occurrence-level idempotency: if this exact slot was already
+            # dispatched (recorded below when the job is returned as due),
+            # suppress the duplicate fire and fast-forward instead. This closes
+            # the re-fire windows where a consumed slot survives in
+            # next_run_at — e.g. jobs.json restored from a backup taken
+            # between dispatch and advance/mark, or a stale external
+            # re-delivery after the fire-claim TTL. Manual fires
+            # (trigger_source) use next_run_at="now", not a real slot, and
+            # one-shots keep their intentional at-least-once retry semantics —
+            # both are exempt.
+            if (
+                kind in {"cron", "interval"}
+                and not job.get("trigger_source")
+                and job.get("last_fired_slot") == next_run
+            ):
+                new_next = compute_next_run(schedule, now.isoformat())
+                logger.warning(
+                    "Job '%s': slot %s was already fired — suppressing "
+                    "duplicate fire; next run: %s",
+                    job.get("name", job["id"]), next_run, new_next,
+                )
+                if new_next:
+                    for rj in raw_jobs:
+                        if rj["id"] == job["id"]:
+                            rj["next_run_at"] = new_next
+                            needs_save = True
+                            break
+                continue
+
             # For recurring jobs, check if the scheduled time is stale
             # (gateway was down and missed the window). Fast-forward to
             # the next future occurrence instead of firing a stale run.
@@ -1511,6 +1589,16 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             needs_save = True
                             break
                     # Fall through to due.append(job) — execute once now
+
+            # Record the slot this dispatch consumes (scheduled recurring
+            # fires only) so a duplicate due-check for the same occurrence is
+            # suppressed above.
+            if kind in {"cron", "interval"} and not job.get("trigger_source"):
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        rj["last_fired_slot"] = next_run
+                        needs_save = True
+                        break
 
             due.append(job)
 

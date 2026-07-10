@@ -82,3 +82,38 @@ def test_mark_job_run_clears_claim(temp_home):
     assert get_job(jid).get("fire_claim") is None
     # …and the re-armed recurring job is claimable again.
     assert claim_job_for_fire(jid) is True
+
+
+def test_manual_claim_leaves_future_slot_untouched(temp_home):
+    """A run-now claim (scheduled=False) must not consume or re-phase the
+    pending scheduled slot — the exact perturbation that made manual re-runs
+    shift interval schedules (2026-07-09 BetNews incident)."""
+    from cron.jobs import create_job, claim_job_for_fire, get_job
+
+    job = create_job(prompt="x", schedule="every 2h", name="m")
+    jid = job["id"]
+    before = get_job(jid)["next_run_at"]
+
+    assert claim_job_for_fire(jid, scheduled=False) is True
+    assert get_job(jid)["next_run_at"] == before
+    # The claim still blocks a concurrent duplicate fire.
+    assert claim_job_for_fire(jid) is False
+
+
+def test_manual_claim_advances_due_slot(temp_home):
+    """A run-now that lands when the slot is already due DOES advance
+    next_run_at — otherwise a racing tick could double-fire the occurrence."""
+    from datetime import datetime, timedelta
+    from cron.jobs import (
+        create_job, claim_job_for_fire, get_job, load_jobs, save_jobs,
+    )
+
+    job = create_job(prompt="x", schedule="every 5m", name="d")
+    jid = job["id"]
+    jobs = load_jobs()
+    stale = (datetime.now() - timedelta(minutes=1)).isoformat()
+    jobs[0]["next_run_at"] = stale
+    save_jobs(jobs)
+
+    assert claim_job_for_fire(jid, scheduled=False) is True
+    assert get_job(jid)["next_run_at"] != stale

@@ -2761,17 +2761,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
     try:
-        # How this fire was initiated: "manual" (out-of-band via trigger_job/
-        # `hermes cron run`) vs "scheduled" (ticker fired it at its cron time).
-        # Tag the saved output header and thread it to mark_job_run so a manual
-        # debug run is unambiguous and doesn't consume the repeat budget.
+        # How this fire was initiated: "manual"/"cli"/"api" (out-of-band via
+        # trigger_job, `hermes cron run`, or the REST endpoints) vs "scheduled"
+        # (ticker fired it at its cron time). Tag the saved output header and
+        # thread it to mark_job_run so a manual debug run is unambiguous and
+        # doesn't consume the repeat budget.
         trigger = job.get("trigger_source") or "scheduled"
+        fired_at = _hermes_now().strftime('%Y-%m-%d %H:%M:%S')
 
         success, output, final_response, error = run_job(job)
 
-        if trigger != "scheduled" and isinstance(output, str) and "**Run Time:**" in output:
+        # Tag EVERY saved output with the trigger and the FIRE time. The
+        # body's **Run Time:** is stamped at completion, which made a slow
+        # scheduled run and a manual re-run indistinguishable in the output
+        # dir (2026-07-09 BetNews incident).
+        if isinstance(output, str) and "**Run Time:**" in output:
             output = output.replace(
-                "**Run Time:**", f"**Trigger:** {trigger}\n**Run Time:**", 1
+                "**Run Time:**",
+                f"**Trigger:** {trigger}\n**Fired:** {fired_at}\n**Run Time:**",
+                1,
             )
 
         output_file = save_job_output(job["id"], output)

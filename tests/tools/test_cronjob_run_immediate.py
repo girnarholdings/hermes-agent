@@ -29,8 +29,33 @@ class TestCronjobRunExecutesImmediately:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
+        # At-most-once claim taken, with scheduled=False so the pending
+        # scheduled slot isn't consumed by an out-of-band run.
+        m_claim.assert_called_once_with("job-run-1", scheduled=False)
         m_run.assert_called_once()                       # fired via the shared body
+        # The fired job dict is stamped so the run is recorded as manual
+        # (tagged output header, repeat budget untouched).
+        assert m_run.call_args[0][0]["trigger_source"] == "manual"
+
+    def test_run_action_threads_cli_trigger_source(self):
+        """`hermes cron run` passes trigger_source='cli' through to the fire."""
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)):
+            cronjob(action="run", job_id="job-run-1", trigger_source="cli")
+
+        assert m_run.call_args[0][0]["trigger_source"] == "cli"
+
+    def test_execute_job_now_clamps_unknown_trigger(self):
+        """trigger_source lands in the persisted store and the output header —
+        unknown values are clamped to 'manual'."""
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch("tools.cronjob_tools.get_job", return_value=dict(_JOB)):
+            _execute_job_now(dict(_JOB), trigger="scheduled")
+
+        assert m_run.call_args[0][0]["trigger_source"] == "manual"
 
     def test_run_skips_when_claim_lost(self):
         """If the scheduler already holds the fire claim, do NOT double-run."""
@@ -79,3 +104,6 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         assert "boom" in res["error"]
         m_mark.assert_called_once()
+        # The failure record keeps the manual tag — it must not read as a
+        # scheduled fire in last_trigger.
+        assert m_mark.call_args.kwargs.get("trigger") == "manual"

@@ -492,7 +492,9 @@ class TestRunJob:
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == triggered_job
-                mock_trigger.assert_called_once_with(VALID_JOB_ID)
+                # The REST endpoint tags the fire as source="api" so the run
+                # is recorded/tagged as an API trigger, not a scheduled fire.
+                mock_trigger.assert_called_once_with(VALID_JOB_ID, source="api")
 
 
 # ---------------------------------------------------------------------------
