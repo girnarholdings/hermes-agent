@@ -1048,6 +1048,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    retry: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1105,6 +1106,24 @@ def create_job(
     # Auto-set repeat=1 for one-shot schedules if not specified
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
+
+    # Normalize retry config. Accept {"max_attempts": N, "delay_seconds": S}
+    # or None. A missing/invalid config means no retry (current behavior).
+    # max_attempts < 1 or delay_seconds < 1 are rejected — a retry that never
+    # fires or fires instantly is a misconfiguration, not a default.
+    normalized_retry = None
+    if retry is not None:
+        if not isinstance(retry, dict):
+            raise ValueError("retry must be a dict {max_attempts, delay_seconds} or None")
+        max_attempts = retry.get("max_attempts")
+        delay_seconds = retry.get("delay_seconds")
+        if max_attempts is None or delay_seconds is None:
+            raise ValueError("retry requires both max_attempts and delay_seconds")
+        if not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ValueError("retry.max_attempts must be an int >= 1")
+        if not isinstance(delay_seconds, int) or delay_seconds < 1:
+            raise ValueError("retry.delay_seconds must be an int >= 1")
+        normalized_retry = {"max_attempts": max_attempts, "delay_seconds": delay_seconds}
 
     # Default delivery to origin if available, otherwise local
     if deliver is None:
@@ -1198,6 +1217,12 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
+        # Optional retry-on-failure config. None = no retry (current behavior).
+        # When set, the scheduler re-arms next_run_at to now+delay_seconds after
+        # a failed run, up to max_attempts times, before reverting to the cron
+        # schedule. retry_count tracks consecutive failures and resets on success.
+        "retry": normalized_retry,
+        "retry_count": 0,
         "enabled": True,
         "state": "scheduled",
         "paused_at": None,
@@ -1484,6 +1509,14 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
+                # Reset the consecutive-failure counter on success so a job that
+                # failed-then-recovered clears its retry budget. The scheduler's
+                # _record_job_outcome helper bumps retry_count on failure and
+                # re-arms next_run_at post-mark_job_run (mark_job_run's own
+                # next_run_at = compute_next_run(...) at L1526 is overwritten by
+                # the helper when a retry is due).
+                if success and job.get("retry_count", 0) > 0:
+                    job["retry_count"] = 0
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
