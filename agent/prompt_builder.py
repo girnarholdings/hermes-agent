@@ -1951,11 +1951,17 @@ def build_context_files_prompt(
 ) -> str:
     """Discover and load context files for the system prompt.
 
-    Priority (first found wins — only ONE project context type is loaded):
-      1. .hermes.md / HERMES.md  (walk to git root)
-      2. AGENTS.md / agents.md   (cwd only)
-      3. CLAUDE.md / claude.md   (cwd only)
-      4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
+    Loading model (roles are distinct; AGENTS.md is no longer shadowed):
+
+      - HERMES.md / .hermes.md (walk to git root) — hand-authored machine
+        operating manual. Loaded as the primary project context when present.
+      - AGENTS.md / agents.md (cwd only) — auto-generated Layer-0 nav index
+        (master project/profile index + drill-down procedure). Loaded
+        ALONGSIDE HERMES.md when both are present: they serve different roles,
+        so AGENTS.md must never be shadowed by a sibling HERMES.md.
+      - If no HERMES.md is found, AGENTS.md/CLAUDE.md/.cursorrules fall back to
+        a first-match-wins chain (these ARE alternate ecosystem equivalents:
+        AGENTS.md ↔ CLAUDE.md ↔ .cursorrules).
 
     SOUL.md from HERMES_HOME is independent and always included when present.
 
@@ -1973,15 +1979,26 @@ def build_context_files_prompt(
     cwd_path = Path(cwd).resolve()
     sections = []
 
-    # Priority-based project context: first match wins
-    project_context = (
-        _load_hermes_md(cwd_path, context_length)
-        or _load_agents_md(cwd_path, context_length)
-        or _load_claude_md(cwd_path, context_length)
-        or _load_cursorrules(cwd_path, context_length)
-    )
-    if project_context:
-        sections.append(project_context)
+    # HERMES.md is the primary project context (machine operating manual).
+    hermes_context = _load_hermes_md(cwd_path, context_length)
+
+    # AGENTS.md is the auto-generated Layer-0 nav index — a DIFFERENT role from
+    # HERMES.md, so it loads ALONGSIDE it (never shadowed). When no HERMES.md is
+    # present, AGENTS.md/CLAUDE.md/.cursorrules remain mutually-exclusive
+    # alternates (first match wins) since they are ecosystem equivalents.
+    if hermes_context:
+        sections.append(hermes_context)
+        agents_context = _load_agents_md(cwd_path, context_length)
+        if agents_context:
+            sections.append(agents_context)
+    else:
+        project_context = (
+            _load_agents_md(cwd_path, context_length)
+            or _load_claude_md(cwd_path, context_length)
+            or _load_cursorrules(cwd_path, context_length)
+        )
+        if project_context:
+            sections.append(project_context)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:
