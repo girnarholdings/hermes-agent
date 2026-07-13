@@ -238,7 +238,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim, update_job
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3394,6 +3394,69 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _record_job_outcome(job: dict, success: bool, error: Optional[str],
+                        delivery_error: Optional[str] = None) -> None:
+    """Record a job's run outcome, re-arming a retry on failure when configured.
+
+    Wraps ``mark_job_run`` with optional retry-on-failure. Always records the
+    honest outcome first (so ``last_status``/``last_error`` reflect reality),
+    then — if the job has a ``retry`` config, the run failed, and attempts
+    remain — overwrites ``next_run_at`` with a near-future retry instant. The
+    normal ticker picks up the retried job via its existing ``next_run_at <=
+    now`` due-check (no separate retry queue).
+
+    ``mark_job_run`` recomputes ``next_run_at`` from the cron schedule (its
+    L1526), so the retry re-arm MUST run *after* it to override that. On
+    success, ``retry_count`` is reset to 0 (done inside mark_job_run) so a
+    job that failed-then-recovered clears its budget.
+
+    The interrupted-flag consume is intentionally the caller's responsibility
+    (stays *outside* this helper) so a manually-interrupted run is never
+    silently retried.
+    """
+    # Always record the honest outcome + recompute the cron next_run_at.
+    mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+
+    retry_cfg = job.get("retry")
+    if not retry_cfg:
+        return  # no retry configured — current behavior preserved exactly
+
+    max_attempts = retry_cfg.get("max_attempts", 0)
+    delay_seconds = retry_cfg.get("delay_seconds", 300)
+    # Re-read the job to pick up the retry_count mark_job_run may have reset
+    # (on success) or left intact (on failure).
+    from cron.jobs import get_job
+    current = get_job(job["id"])
+    if current is None:
+        return
+    retry_count = current.get("retry_count", 0)
+
+    if success:
+        # retry_count already reset to 0 inside mark_job_run; nothing to do.
+        return
+
+    if retry_count >= max_attempts:
+        logger.info(
+            "[retry] job '%s' (%s) failed — retry budget exhausted "
+            "(%d/%d attempts); reverting to cron schedule",
+            job.get("name", job["id"]), job["id"], retry_count, max_attempts,
+        )
+        return
+
+    # Re-arm: schedule a retry `delay_seconds` from now. update_job persists
+    # under the jobs lock so the re-arm is atomic with the retry_count bump.
+    from datetime import timedelta
+    retry_at = (_hermes_now() + timedelta(seconds=delay_seconds)).isoformat()
+    next_count = retry_count + 1
+    update_job(job["id"], {"next_run_at": retry_at, "retry_count": next_count})
+    logger.info(
+        "[retry] job '%s' (%s) failed (attempt %d/%d) — re-arming for +%.0fs "
+        "(next_run_at=%s). Error: %s",
+        job.get("name", job["id"]), job["id"], next_count, max_attempts,
+        delay_seconds, retry_at, (error or "")[:120],
+    )
+
+
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -3529,13 +3592,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            _record_job_outcome(job, success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
+            _record_job_outcome(job, False, str(e))
         return False
 
 
