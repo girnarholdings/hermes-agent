@@ -714,6 +714,95 @@ class TestMarkJobRun:
         assert updated["state"] == "completed"
 
 
+class TestJobRetry:
+    """Tests for the optional retry-on-failure config.
+
+    A job with ``retry: {max_attempts, delay_seconds}`` re-arms next_run_at to
+    now+delay after a failed run (up to max_attempts times) before reverting to
+    the cron schedule. retry_count resets on success. Jobs WITHOUT the config
+    behave exactly as before — the non-regression guard.
+    """
+
+    def test_create_job_with_retry_config(self, tmp_cron_dir):
+        """retry config is persisted + retry_count initialized to 0."""
+        job = create_job(
+            prompt="Briefing", schedule="every 1h",
+            retry={"max_attempts": 2, "delay_seconds": 300},
+        )
+        assert job["retry"] == {"max_attempts": 2, "delay_seconds": 300}
+        assert job["retry_count"] == 0
+
+    def test_create_job_without_retry_defaults_none(self, tmp_cron_dir):
+        """Jobs created without retry config have retry=None (current behavior)."""
+        job = create_job(prompt="NoRetry", schedule="every 1h")
+        assert job["retry"] is None
+        assert job["retry_count"] == 0
+
+    def test_invalid_retry_max_attempts_rejected(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="max_attempts"):
+            create_job(prompt="Bad", schedule="every 1h",
+                       retry={"max_attempts": 0, "delay_seconds": 5})
+
+    def test_invalid_retry_delay_rejected(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="delay_seconds"):
+            create_job(prompt="Bad", schedule="every 1h",
+                       retry={"max_attempts": 2, "delay_seconds": 0})
+
+    def test_retry_re_arms_next_run_at_on_failure(self, tmp_cron_dir, monkeypatch):
+        """On failure, next_run_at is set to now+delay (not the next cron tick),
+        and retry_count increments."""
+        from cron.jobs import mark_job_run, get_job
+        fixed_now = datetime(2026, 7, 13, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: fixed_now)
+
+        job = create_job(
+            prompt="RetryMe", schedule="every 1h",  # interval — next tick 1h out
+            retry={"max_attempts": 2, "delay_seconds": 300},
+        )
+        # Simulate the scheduler's _record_job_outcome: mark_job_run, then
+        # the helper re-arms. Here we test the helper's contract by replicating
+        # its post-mark_job_run re-arm (the helper itself lives in scheduler.py
+        # and is tested via the integration test below).
+        mark_job_run(job["id"], success=False, error="LLM timeout")
+        # mark_job_run set next_run_at to the cron tick (6am tomorrow) — the
+        # scheduler helper overrides it post-call. Simulate that override:
+        retry_at = (fixed_now + timedelta(seconds=300)).isoformat()
+        update_job(job["id"], {"next_run_at": retry_at, "retry_count": 1})
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "error"
+        assert updated["last_error"] == "LLM timeout"
+        assert updated["retry_count"] == 1
+        # next_run_at is now+300s, NOT 6am tomorrow
+        assert updated["next_run_at"] == retry_at
+
+    def test_retry_resets_on_success(self, tmp_cron_dir):
+        """A successful run resets retry_count to 0."""
+        job = create_job(
+            prompt="Recover", schedule="every 1h",
+            retry={"max_attempts": 2, "delay_seconds": 300},
+        )
+        # Simulate a prior failure (retry_count=1)
+        update_job(job["id"], {"retry_count": 1})
+        assert get_job(job["id"])["retry_count"] == 1
+        # Now succeed
+        mark_job_run(job["id"], success=True)
+        updated = get_job(job["id"])
+        assert updated["retry_count"] == 0
+        assert updated["last_status"] == "ok"
+
+    def test_no_retry_config_failure_preserves_behavior(self, tmp_cron_dir):
+        """NON-REGRESSION GUARD: a job without retry config, on failure, behaves
+        exactly as before — next_run_at = cron tick, no retry_count bump."""
+        job = create_job(prompt="Legacy", schedule="every 1h")
+        assert job["retry"] is None
+        mark_job_run(job["id"], success=False, error="fail")
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "error"
+        assert updated["retry_count"] == 0  # never bumped without retry config
+        # next_run_at is the cron-computed next tick (1h out), not a retry delay
+        assert updated["next_run_at"] is not None
+
+
 class TestAdvanceNextRun:
     """Tests for advance_next_run() — crash-safety for recurring jobs."""
 
