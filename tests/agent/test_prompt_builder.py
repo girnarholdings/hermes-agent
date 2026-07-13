@@ -866,13 +866,15 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "BLOCKED" in result
 
-    def test_hermes_md_beats_agents_md(self, tmp_path):
-        """When both exist, .hermes.md wins and AGENTS.md is not loaded."""
+    def test_hermes_md_loads_alongside_agents_md(self, tmp_path):
+        """HERMES.md and AGENTS.md serve distinct roles (machine operating
+        manual vs auto-generated nav index), so BOTH load when both are
+        present — AGENTS.md is not shadowed by a sibling HERMES.md."""
         (tmp_path / "AGENTS.md").write_text("Agent guidelines here.")
         (tmp_path / ".hermes.md").write_text("Hermes project rules.")
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Hermes project rules" in result
-        assert "Agent guidelines" not in result
+        assert "Agent guidelines" in result
 
     def test_agents_md_beats_claude_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Agent guidelines here.")
@@ -920,15 +922,17 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "BLOCKED" in result
 
-    def test_hermes_md_beats_all_others(self, tmp_path):
-        """When all four types exist, only .hermes.md is loaded."""
+    def test_hermes_md_loads_with_agents_excludes_claude_cursor(self, tmp_path):
+        """When all four types exist, HERMES.md AND AGENTS.md load together
+        (distinct roles), while CLAUDE.md and .cursorrules — the true
+        ecosystem-equivalent alternates — stay excluded."""
         (tmp_path / ".hermes.md").write_text("Hermes wins.")
-        (tmp_path / "AGENTS.md").write_text("Agents lose.")
+        (tmp_path / "AGENTS.md").write_text("Agents win too.")
         (tmp_path / "CLAUDE.md").write_text("Claude loses.")
         (tmp_path / ".cursorrules").write_text("Cursor loses.")
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Hermes wins" in result
-        assert "Agents lose" not in result
+        assert "Agents win too" in result
         assert "Claude loses" not in result
         assert "Cursor loses" not in result
 
