@@ -19,6 +19,28 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
+def test_cron_inactivity_timeout_reads_profile_config(monkeypatch):
+    from cron.jobs import _cron_inactivity_timeout_seconds
+
+    monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "cron:\n  agent_inactivity_timeout_seconds: 1800\n"
+    )
+
+    assert _cron_inactivity_timeout_seconds() == 1800.0
+
+
+def test_cron_inactivity_env_override_remains_backward_compatible(monkeypatch):
+    from cron.jobs import _cron_inactivity_timeout_seconds
+
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "cron:\n  agent_inactivity_timeout_seconds: 1800\n"
+    )
+    monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1200")
+
+    assert _cron_inactivity_timeout_seconds() == 1200.0
+
+
 class FakeAgent:
     """Mock agent with controllable activity summary for timeout tests."""
 

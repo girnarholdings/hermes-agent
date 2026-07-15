@@ -195,6 +195,55 @@ class TestRunJobScript:
         assert success is False
         assert "timed out" in output.lower()
 
+    def test_script_output_progress_prevents_stall(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_STALL_TIMEOUT", 1)
+        script = cron_env / "scripts" / "progress.py"
+        script.write_text(
+            "import time\n"
+            "for n in range(5):\n"
+            "    print(f'progress {n}', flush=True)\n"
+            "    time.sleep(0.35)\n"
+        )
+
+        success, output = _run_job_script(str(script), progress_key="job-progress")
+
+        assert success is True
+        assert "progress 4" in output
+
+    def test_silent_script_hits_stall_limit_before_hard_timeout(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 10)
+        monkeypatch.setattr(sched_mod, "_SCRIPT_STALL_TIMEOUT", 1)
+        script = cron_env / "scripts" / "silent.py"
+        script.write_text("import time; time.sleep(30)\n")
+
+        success, output = _run_job_script(str(script), progress_key="job-silent")
+
+        assert success is False
+        assert "stalled" in output.lower()
+
+    def test_script_progress_sidecar_is_owner_only_and_terminal(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "sidecar.py"
+        script.write_text('print("done", flush=True)\n')
+
+        success, _ = _run_job_script(str(script), progress_key="job-sidecar")
+
+        assert success is True
+        progress = cron_env / "cron" / "progress" / "job-sidecar.json"
+        payload = json.loads(progress.read_text())
+        assert payload["schema"] == "hermes.cron-script-progress.v1"
+        assert payload["job_id"] == "job-sidecar"
+        assert payload["status"] == "complete"
+        assert payload["output_events"] >= 1
+        assert progress.stat().st_mode & 0o777 == 0o600
+
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""
         from cron.scheduler import _run_job_script
