@@ -1346,6 +1346,186 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _native_receipt_transport_outcome(
+    send_result,
+    *,
+    require_adapter_confirmation: bool,
+) -> tuple[str, Optional[str]]:
+    """Classify a transport response for the optional native receipt contract.
+
+    Returns ``("sent", message_id)``, ``("not-sent", None)``, or
+    ``("unknown", None)``. Human-readable error text is deliberately ignored:
+    provider exceptions and partial responses can contain identifiers or claim
+    failure after the platform accepted a message.
+    """
+    raw_response = (
+        send_result.get("raw_response")
+        if isinstance(send_result, dict)
+        else getattr(send_result, "raw_response", None)
+    )
+    partial = False
+    for candidate in (send_result, raw_response):
+        if not isinstance(candidate, dict):
+            continue
+        if any(
+            bool(candidate.get(name))
+            for name in (
+                "partial",
+                "partial_delivery",
+                "partial_overflow",
+                "thread_fallback",
+            )
+        ):
+            partial = True
+        delivered_chunks = candidate.get("delivered_chunks")
+        total_chunks = candidate.get("total_chunks")
+        if (
+            isinstance(delivered_chunks, int)
+            and isinstance(total_chunks, int)
+            and delivered_chunks < total_chunks
+        ):
+            partial = True
+    if partial:
+        return "unknown", None
+
+    if isinstance(send_result, dict):
+        if send_result.get("delivered") is False:
+            return "not-sent", None
+        if send_result.get("confirmed_not_sent") is True:
+            return "not-sent", None
+        confirmed = send_result.get("success") is True
+        message_id = send_result.get("message_id")
+    else:
+        if getattr(send_result, "confirmed_not_sent", False) is True:
+            return "not-sent", None
+        confirmed = (
+            _confirm_adapter_delivery(send_result)
+            if require_adapter_confirmation
+            else bool(getattr(send_result, "success", False))
+        )
+        message_id = getattr(send_result, "message_id", None)
+
+    if not confirmed:
+        return "unknown", None
+    receipt = str(message_id or "").strip()
+    if not receipt:
+        return "unknown", None
+    return "sent", receipt
+
+
+def _native_standalone_delivery(
+    *,
+    ledger,
+    receipt_key,
+    platform,
+    pconfig,
+    chat_id,
+    content: str,
+    thread_id,
+    send_to_platform,
+) -> str:
+    """Perform one standalone send under the native receipt state machine.
+
+    ``begin_send`` is intentionally adjacent to the transport call. Any
+    exception once the transport owns the request is ambiguous and therefore
+    leaves the durable state ``unknown``. A queued thread-pool task that can be
+    cancelled before it starts is the only timeout case proven not sent.
+    """
+    from cron.delivery_receipts import (
+        DeliveryReceiptRetryable,
+        DeliveryReceiptUnknown,
+    )
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = False
+    else:
+        running_loop = True
+
+    coro = send_to_platform(
+        platform,
+        pconfig,
+        chat_id,
+        content,
+        thread_id=thread_id,
+        media_files=[],
+    )
+    try:
+        claim = ledger.begin_send(receipt_key, transport="standalone")
+    except BaseException:
+        coro.close()
+        raise
+    if claim["action"] == "duplicate":
+        coro.close()
+        return "duplicate"
+    attempt_id = claim["attempt_id"]
+
+    if not running_loop:
+        try:
+            result = asyncio.run(coro)
+        except BaseException as exc:
+            raise DeliveryReceiptUnknown(
+                "standalone delivery raised after transport began; outcome unknown"
+            ) from exc
+    else:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            try:
+                future = pool.submit(asyncio.run, coro)
+            except BaseException as exc:
+                coro.close()
+                raise DeliveryReceiptUnknown(
+                    "standalone delivery dispatch failed after receipt claim; outcome unknown"
+                ) from exc
+            try:
+                result = future.result(timeout=30)
+            except TimeoutError as exc:
+                if future.cancel():
+                    ledger.record_outcome(
+                        receipt_key,
+                        attempt_id=attempt_id,
+                        outcome="not-sent",
+                    )
+                    raise DeliveryReceiptRetryable(
+                        "standalone delivery timed out before transport started"
+                    ) from exc
+                raise DeliveryReceiptUnknown(
+                    "standalone delivery timed out in flight; outcome unknown"
+                ) from exc
+            except BaseException as exc:
+                raise DeliveryReceiptUnknown(
+                    "standalone delivery raised in flight; outcome unknown"
+                ) from exc
+        finally:
+            pool.shutdown(wait=False)
+
+    outcome, receipt_id = _native_receipt_transport_outcome(
+        result,
+        require_adapter_confirmation=False,
+    )
+    if outcome == "sent":
+        ledger.record_outcome(
+            receipt_key,
+            attempt_id=attempt_id,
+            outcome="sent",
+            receipt_id=receipt_id,
+        )
+        return "sent"
+    if outcome == "not-sent":
+        ledger.record_outcome(
+            receipt_key,
+            attempt_id=attempt_id,
+            outcome="not-sent",
+        )
+        raise DeliveryReceiptRetryable(
+            "standalone transport confirmed that no message was sent"
+        )
+    raise DeliveryReceiptUnknown(
+        "standalone transport returned no durable delivery receipt; outcome unknown"
+    )
+
+
 def _is_channel_dm_topic(
     runtime_adapter: Any,
     chat_id: Any,
@@ -1402,7 +1582,14 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    delivery_evidence=None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1413,10 +1600,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    receipt_ledger = None
+    receipt_completed_targets = 0
+    if delivery_evidence is not None:
+        from cron.delivery_receipts import DeliveryReceiptLedger
+
+        receipt_ledger = DeliveryReceiptLedger()
+
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
+            if receipt_ledger is not None:
+                from cron.delivery_receipts import DeliveryReceiptRetryable
+
+                raise DeliveryReceiptRetryable(
+                    "native receipt evidence has no external delivery target"
+                )
             return None  # local-only jobs don't deliver — not a failure
         # deliver=origin with no resolvable origin and no configured home
         # channels: treat as local rather than reporting an error.  CLI-created
@@ -1430,9 +1630,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 "skipping delivery (output saved in last_output)",
                 job.get("name", job.get("id", "?")),
             )
+            if receipt_ledger is not None:
+                from cron.delivery_receipts import DeliveryReceiptRetryable
+
+                raise DeliveryReceiptRetryable(
+                    "native receipt evidence has no resolvable delivery target"
+                )
             return None
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
+        if receipt_ledger is not None:
+            from cron.delivery_receipts import DeliveryReceiptRetryable
+
+            raise DeliveryReceiptRetryable(msg)
         return msg
 
     from tools.send_message_tool import _send_to_platform
@@ -1466,6 +1676,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    if receipt_ledger is not None and media_files:
+        from cron.delivery_receipts import DeliveryReceiptRetryable
+
+        raise DeliveryReceiptRetryable(
+            "native receipt delivery requires one text receipt; compound media delivery is unsupported"
+        )
+    if receipt_ledger is not None and not cleaned_delivery_content.strip():
+        from cron.delivery_receipts import DeliveryReceiptRetryable
+
+        raise DeliveryReceiptRetryable(
+            "native receipt delivery has no transportable text"
+        )
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -1485,6 +1707,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception as e:
         msg = f"failed to load gateway config: {e}"
         logger.error("Job '%s': %s", job["id"], msg)
+        if receipt_ledger is not None:
+            from cron.delivery_receipts import DeliveryReceiptRetryable
+
+            raise DeliveryReceiptRetryable(msg) from e
         return msg
 
     delivery_errors = []
@@ -1493,6 +1719,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        receipt_key = None
+        if receipt_ledger is not None:
+            from cron.delivery_receipts import (
+                DeliveryReceiptBlocked,
+                build_receipt_key,
+            )
+
+            receipt_key = build_receipt_key(
+                delivery_evidence,
+                platform=platform_name,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+            existing_receipt = receipt_ledger.get(receipt_key)
+            if existing_receipt is not None:
+                if existing_receipt["state"] == "sent":
+                    logger.info(
+                        "Job '%s': native receipt already sent for %s; suppressing duplicate",
+                        job["id"],
+                        platform_name,
+                    )
+                    receipt_completed_targets += 1
+                    continue
+                if existing_receipt["state"] == "unknown":
+                    raise DeliveryReceiptBlocked(
+                        "previous delivery outcome is unknown; automatic retry blocked"
+                    )
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -1526,6 +1779,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         except (ValueError, KeyError):
             msg = f"unknown platform '{platform_name}'"
             logger.warning("Job '%s': %s", job["id"], msg)
+            if receipt_ledger is not None:
+                from cron.delivery_receipts import DeliveryReceiptRetryable
+
+                raise DeliveryReceiptRetryable(msg)
             delivery_errors.append(msg)
             continue
 
@@ -1533,6 +1790,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         if not pconfig or not pconfig.enabled:
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
+            if receipt_ledger is not None:
+                from cron.delivery_receipts import DeliveryReceiptRetryable
+
+                raise DeliveryReceiptRetryable(msg)
             delivery_errors.append(msg)
             continue
 
@@ -1703,6 +1964,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     # detection when "thread_id"/"message_thread_id" are absent
                     # from metadata, deriving the routing from target.thread_id
                     # or the explicit direct_messages_topic_id above.
+                    receipt_attempt_id = None
+                    if receipt_ledger is not None:
+                        claim = receipt_ledger.begin_send(
+                            receipt_key,
+                            transport="live_adapter",
+                        )
+                        if claim["action"] == "duplicate":
+                            receipt_completed_targets += 1
+                            continue
+                        receipt_attempt_id = claim["attempt_id"]
+
                     future = safe_schedule_threadsafe(
                         router._deliver_to_platform(
                             route_target,
@@ -1712,6 +1984,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                     )
                     if future is None:
+                        if receipt_ledger is not None:
+                            receipt_ledger.record_outcome(
+                                receipt_key,
+                                attempt_id=receipt_attempt_id,
+                                outcome="not-sent",
+                            )
                         adapter_ok = False
                         target_errors.append("live adapter event loop scheduling failed")
                     else:
@@ -1739,6 +2017,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             #     duplicate).
                             cancelled = future.cancel()
                             if cancelled:
+                                if receipt_ledger is not None:
+                                    receipt_ledger.record_outcome(
+                                        receipt_key,
+                                        attempt_id=receipt_attempt_id,
+                                        outcome="not-sent",
+                                    )
                                 msg = (
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     "timed out before the coroutine was dispatched"
@@ -1751,6 +2035,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 adapter_ok = False  # fall through to standalone path
                                 timeout_handled = True
                             else:
+                                if receipt_ledger is not None:
+                                    from cron.delivery_receipts import (
+                                        DeliveryReceiptUnknown,
+                                    )
+
+                                    raise DeliveryReceiptUnknown(
+                                        "live adapter delivery timed out in flight; "
+                                        "outcome unknown"
+                                    )
                                 timed_out = True
                                 timeout_handled = True
                                 logger.warning(
@@ -1761,6 +2054,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     job["id"], platform_name, chat_id,
                                 )
                         except Exception as ex:
+                            if receipt_ledger is not None:
+                                from cron.delivery_receipts import (
+                                    DeliveryReceiptError,
+                                    DeliveryReceiptUnknown,
+                                )
+
+                                if isinstance(ex, DeliveryReceiptError):
+                                    raise
+                                raise DeliveryReceiptUnknown(
+                                    "live adapter delivery raised in flight; outcome unknown"
+                                ) from ex
                             # A real send error (not a slow confirmation) — fall
                             # through to the standalone path so the message is
                             # still delivered.
@@ -1774,6 +2078,35 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # dispatched).  send_result is None, so skip the
                             # confirmation/thread-fallback inspection below.
                             pass
+                        elif receipt_ledger is not None:
+                            from cron.delivery_receipts import DeliveryReceiptUnknown
+
+                            native_outcome, receipt_id = (
+                                _native_receipt_transport_outcome(
+                                    send_result,
+                                    require_adapter_confirmation=True,
+                                )
+                            )
+                            if native_outcome == "sent":
+                                receipt_ledger.record_outcome(
+                                    receipt_key,
+                                    attempt_id=receipt_attempt_id,
+                                    outcome="sent",
+                                    receipt_id=receipt_id,
+                                )
+                                receipt_completed_targets += 1
+                            elif native_outcome == "not-sent":
+                                receipt_ledger.record_outcome(
+                                    receipt_key,
+                                    attempt_id=receipt_attempt_id,
+                                    outcome="not-sent",
+                                )
+                                adapter_ok = False
+                            else:
+                                raise DeliveryReceiptUnknown(
+                                    "live adapter returned no durable delivery receipt; "
+                                    "outcome unknown"
+                                )
                         else:
                             # _deliver_to_platform returns either a SendResult
                             # (.success attr) or, when the silence-narration
@@ -1878,6 +2211,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
             except Exception as e:
+                if receipt_ledger is not None:
+                    from cron.delivery_receipts import DeliveryReceiptError
+
+                    if isinstance(e, DeliveryReceiptError):
+                        raise
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
@@ -1887,6 +2225,43 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
 
         if not delivered:
+            if receipt_ledger is not None:
+                from cron.delivery_receipts import DeliveryReceiptRetryable
+
+                if _interpreter_shutting_down():
+                    raise DeliveryReceiptRetryable(
+                        "standalone delivery did not start because the interpreter "
+                        "is shutting down"
+                    )
+                standalone_outcome = _native_standalone_delivery(
+                    ledger=receipt_ledger,
+                    receipt_key=receipt_key,
+                    platform=platform,
+                    pconfig=pconfig,
+                    chat_id=chat_id,
+                    content=cleaned_delivery_content,
+                    thread_id=thread_id,
+                    send_to_platform=_send_to_platform,
+                )
+                if standalone_outcome in {"sent", "duplicate"}:
+                    receipt_completed_targets += 1
+                    logger.info(
+                        "Job '%s': delivered to %s:%s with native receipt",
+                        job["id"],
+                        platform_name,
+                        chat_id,
+                    )
+                    _maybe_mirror_cron_delivery(
+                        job,
+                        platform_name,
+                        chat_id,
+                        mirror_text,
+                        thread_id=thread_id,
+                        user_id=origin_user_id,
+                        enabled=mirror_this_target and not thread_seeded,
+                    )
+                    continue
+
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
             # fresh ThreadPoolExecutor both raise "cannot schedule new futures
@@ -1968,6 +2343,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 enabled=mirror_this_target and not thread_seeded,
             )
 
+    if receipt_ledger is not None:
+        if receipt_completed_targets == len(targets):
+            return None
+        from cron.delivery_receipts import DeliveryReceiptRetryable
+
+        raise DeliveryReceiptRetryable(
+            "native receipt delivery did not complete every configured target"
+        )
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
@@ -2161,7 +2544,11 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+def _build_job_prompt(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+    delivery_evidence_out: Optional[list] = None,
+) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -2171,6 +2558,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             When provided, the script is not re-executed and the cached
             result is used for prompt injection. When omitted, the script
             (if any) runs inline as before.
+        delivery_evidence_out: Optional caller-owned list. A validated native
+            receipt evidence object is appended when the script emitted the
+            strict generic marker. The marker itself is removed before prompt
+            injection.
     """
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
@@ -2190,6 +2581,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         else:
             success, script_output = _run_job_script(script_path)
         if success:
+            from cron.delivery_receipts import extract_delivery_evidence
+
+            script_output, delivery_evidence = extract_delivery_evidence(
+                script_output
+            )
+            if delivery_evidence is not None and delivery_evidence_out is not None:
+                delivery_evidence_out.append(delivery_evidence)
             if script_output:
                 prompt = (
                     "## Script Output\n"
@@ -2483,7 +2881,10 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    delivery_evidence_out: Optional[list] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2549,6 +2950,13 @@ def run_job(
                     os.chdir(_prior_cwd)
                 except OSError:
                     pass
+
+        if ok:
+            from cron.delivery_receipts import extract_delivery_evidence
+
+            output, delivery_evidence = extract_delivery_evidence(output)
+            if delivery_evidence is not None and delivery_evidence_out is not None:
+                delivery_evidence_out.append(delivery_evidence)
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2647,7 +3055,10 @@ def run_job(
             return True, silent_doc, SILENT_MARKER, None
 
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        prompt_kwargs = {"prerun_script": prerun_script}
+        if delivery_evidence_out is not None:
+            prompt_kwargs["delivery_evidence_out"] = delivery_evidence_out
+        prompt = _build_job_prompt(job, **prompt_kwargs)
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -3394,8 +3805,14 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def _record_job_outcome(job: dict, success: bool, error: Optional[str],
-                        delivery_error: Optional[str] = None) -> None:
+def _record_job_outcome(
+    job: dict,
+    success: bool,
+    error: Optional[str],
+    delivery_error: Optional[str] = None,
+    *,
+    retry_allowed: bool = True,
+) -> None:
     """Record a job's run outcome, re-arming a retry on failure when configured.
 
     Wraps ``mark_job_run`` with optional retry-on-failure. Always records the
@@ -3416,6 +3833,14 @@ def _record_job_outcome(job: dict, success: bool, error: Optional[str],
     """
     # Always record the honest outcome + recompute the cron next_run_at.
     mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+
+    if not retry_allowed:
+        logger.warning(
+            "[retry] job '%s' (%s) automatic retry blocked by delivery receipt state",
+            job.get("name", job["id"]),
+            job["id"],
+        )
+        return
 
     retry_cfg = job.get("retry")
     if not retry_cfg:
@@ -3511,10 +3936,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _delivery_evidence: list = []
         try:
-            success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
-            )
+            run_kwargs = {"defer_agent_teardown": _deferred_agents}
+            # Compatibility for embedders/tests that monkeypatch the historical
+            # two-argument function: only pass the optional narrow-waist holder
+            # when the callable advertises it.
+            import inspect
+
+            if "delivery_evidence_out" in inspect.signature(run_job).parameters:
+                run_kwargs["delivery_evidence_out"] = _delivery_evidence
+            success, output, final_response, error = run_job(job, **run_kwargs)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -3534,6 +3966,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         delivery_error = None
+        retry_allowed = True
         try:
             output_file = save_job_output(job["id"], output)
             if verbose:
@@ -3573,10 +4006,34 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    deliver_kwargs = {"adapters": adapters, "loop": loop}
+                    if _delivery_evidence:
+                        deliver_kwargs["delivery_evidence"] = _delivery_evidence[0]
+                    delivery_error = _deliver_result(
+                        job,
+                        deliver_content,
+                        **deliver_kwargs,
+                    )
                 except Exception as de:
                     delivery_error = str(de)
+                    if _delivery_evidence:
+                        from cron.delivery_receipts import (
+                            DeliveryReceiptError,
+                            DeliveryReceiptRetryable,
+                        )
+
+                        success = False
+                        error = delivery_error
+                        retry_allowed = isinstance(de, DeliveryReceiptRetryable)
+                        if not isinstance(de, DeliveryReceiptError):
+                            retry_allowed = False
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+            elif _delivery_evidence:
+                success = False
+                error = (
+                    "native delivery evidence was produced, but the run returned "
+                    "no transportable response"
+                )
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
             # (or raised). Must happen on every path so cron agents never leak
@@ -3592,13 +4049,26 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            _record_job_outcome(job, success, error, delivery_error=delivery_error)
+            _record_job_outcome(
+                job,
+                success,
+                error,
+                delivery_error=delivery_error,
+                retry_allowed=retry_allowed,
+            )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
-            _record_job_outcome(job, False, str(e))
+            from cron.delivery_receipts import DeliveryReceiptError
+
+            _record_job_outcome(
+                job,
+                False,
+                str(e),
+                retry_allowed=not isinstance(e, DeliveryReceiptError),
+            )
         return False
 
 
