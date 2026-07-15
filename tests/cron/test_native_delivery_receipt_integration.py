@@ -505,6 +505,40 @@ def test_run_one_passes_evidence_to_delivery(monkeypatch):
     assert captured["evidence"] == _evidence()
 
 
+def test_failed_agent_alert_cannot_consume_producer_receipt(monkeypatch):
+    captured = {}
+    recorded = {}
+
+    def run_job(job, *, defer_agent_teardown=None, delivery_evidence_out=None):
+        delivery_evidence_out.append(_evidence())
+        return False, "producer output", "", "model failed"
+
+    def deliver(job, content, adapters=None, loop=None, *, delivery_evidence=None):
+        captured["content"] = content
+        captured["evidence"] = delivery_evidence
+        return None
+
+    def record(job, success, error, delivery_error=None, *, retry_allowed=True):
+        recorded.update(success=success, error=error, retry_allowed=retry_allowed)
+
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "run_job", run_job)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/out")
+    monkeypatch.setattr(scheduler, "_deliver_result", deliver)
+    monkeypatch.setattr(scheduler, "_record_job_outcome", record)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+
+    assert scheduler.run_one_job(_job()) is True
+    assert "model failed" in captured["content"]
+    assert captured["evidence"] is None
+    assert recorded == {
+        "success": False,
+        "error": "model failed",
+        "retry_allowed": True,
+    }
+
+
 def test_unknown_delivery_marks_failure_and_blocks_automatic_retry(monkeypatch):
     recorded = {}
 
