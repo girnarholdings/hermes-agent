@@ -51,6 +51,44 @@ def _make_adapter() -> TelegramAdapter:
 
 
 @pytest.mark.asyncio
+async def test_runtime_observer_records_poll_error_then_recovery():
+    """Infra inventory receives both sides of a polling reconnect boundary."""
+    adapter = _make_adapter()
+    events = []
+    adapter.set_adapter_runtime_observer(
+        lambda event, error_class=None: events.append((event, error_class))
+    )
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+    mock_updater.stop = AsyncMock()
+    mock_updater.start_polling = AsyncMock(return_value=None)
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    adapter._app = mock_app
+
+    class PollTransportError(Exception):
+        pass
+
+    with patch("asyncio.sleep", new_callable=AsyncMock), patch.object(
+        adapter, "_drain_polling_connections", new_callable=AsyncMock
+    ):
+        await adapter._handle_polling_network_error(
+            PollTransportError("message-content-canary")
+        )
+
+    assert events[0] == ("poll_error", PollTransportError)
+    assert ("poll_success", None) in events
+
+    for task in list(adapter._background_tasks):
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_reconnect_self_schedules_on_start_polling_failure():
     """
     When start_polling() raises during a network error retry, the adapter must
@@ -986,4 +1024,3 @@ async def test_handle_polling_network_error_updater_stop_timeout():
     # The reconnect ladder must have advanced past the hung stop().
     assert drain_called, "_drain_polling_connections was not called after stop() timeout"
     assert start_polling_called, "start_polling was not called after stop() timeout"
-

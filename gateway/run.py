@@ -4657,6 +4657,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _update_adapter_runtime_inventory(
+        self,
+        profile: str,
+        platform: str,
+        **changes,
+    ) -> None:
+        """Best-effort redacted per-profile adapter lifecycle persistence."""
+        try:
+            from gateway.adapter_runtime import update_adapter_runtime
+
+            update_adapter_runtime(profile or "default", platform, **changes)
+        except Exception:
+            logger.debug(
+                "Could not persist adapter runtime inventory for %s/%s",
+                profile or "default",
+                platform,
+                exc_info=True,
+            )
+
+    def _record_adapter_runtime_event(
+        self,
+        profile: str,
+        platform: str,
+        event: str,
+        error_class=None,
+    ) -> None:
+        """Translate adapter lifecycle callbacks into the redacted schema."""
+        if event == "authenticated":
+            changes = {"authenticated": True}
+        elif event == "connected":
+            changes = {"connected": True}
+        elif event == "poll_success":
+            changes = {
+                "connected": True,
+                "authenticated": True,
+                "poll_succeeded": True,
+            }
+        elif event in {"poll_error", "error"}:
+            changes = {"connected": False, "error": error_class or RuntimeError}
+        elif event in {"disconnected", "stopped"}:
+            changes = {
+                "connected": False,
+                "authenticated": False,
+            }
+        else:
+            logger.debug("Ignoring unknown adapter runtime event %s", event)
+            return
+        self._update_adapter_runtime_inventory(profile, platform, **changes)
+
+    def _bind_adapter_runtime_inventory(
+        self,
+        adapter,
+        *,
+        profile: str,
+        platform: Platform,
+    ) -> None:
+        """Bind one adapter instance to its immutable profile/platform key."""
+        setter = getattr(adapter, "set_adapter_runtime_observer", None)
+        if not callable(setter):
+            return
+        setter(
+            lambda event, error_class=None: self._record_adapter_runtime_event(
+                profile or "default", platform.value, event, error_class
+            )
+        )
+
     # ------------------------------------------------------------------
     # Per-platform circuit breaker (pause/resume) — used by the reconnect
     # watcher when a retryable failure recurs past a threshold, and by the
@@ -6829,6 +6895,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             write_runtime_status(gateway_state="starting", exit_reason=None)
         except Exception:
             pass
+        try:
+            from gateway.adapter_runtime import reset_adapter_runtime_inventory
+
+            reset_adapter_runtime_inventory()
+        except Exception:
+            logger.warning(
+                "Could not initialize redacted adapter runtime inventory",
+                exc_info=True,
+            )
 
         # Log any active supply-chain security advisories. Operators see this
         # in gateway.log and `hermes status` surfaces it; we do NOT block
@@ -7077,12 +7152,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_config in self.config.platforms.items():
             if await self._abort_startup_if_shutdown_requested():
                 return True
+            _active_profile = self._active_profile_name()
+            self._update_adapter_runtime_inventory(
+                _active_profile,
+                platform.value,
+                configured=True,
+                enabled=bool(platform_config.enabled),
+                connected=False,
+                authenticated=False,
+                clear_error=True,
+            )
             if not platform_config.enabled:
                 continue
             enabled_platform_count += 1
             
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
+                from gateway.adapter_runtime import AdapterUnavailableError
+
+                self._update_adapter_runtime_inventory(
+                    _active_profile,
+                    platform.value,
+                    error=AdapterUnavailableError,
+                )
                 # Distinguish between missing builtin deps and missing plugin
                 _pval = platform.value
                 _builtin_names = {m.value for m in Platform.__members__.values()}
@@ -7095,6 +7187,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     logger.warning("No adapter available for %s", _pval)
                 continue
+
+            self._bind_adapter_runtime_inventory(
+                adapter, profile=_active_profile, platform=platform
+            )
             
             # Set up message + fatal error handlers
             adapter.set_message_handler(self._handle_message)
@@ -7121,6 +7217,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
+                    self._update_adapter_runtime_inventory(
+                        _active_profile,
+                        platform.value,
+                        connected=True,
+                        authenticated=True,
+                    )
                     self._update_platform_runtime_status(
                         platform.value,
                         platform_state="connected",
@@ -7129,6 +7231,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     logger.info("✓ %s connected", platform.value)
                 else:
+                    from gateway.adapter_runtime import (
+                        AdapterConnectError,
+                        AdapterFatalError,
+                    )
+
+                    self._update_adapter_runtime_inventory(
+                        _active_profile,
+                        platform.value,
+                        connected=False,
+                        authenticated=False,
+                        error=(
+                            AdapterFatalError
+                            if adapter.has_fatal_error
+                            else AdapterConnectError
+                        ),
+                    )
                     logger.warning("✗ %s failed to connect", platform.value)
                     # Defensive cleanup: a failed connect() may have
                     # allocated resources (aiohttp.ClientSession, poll
@@ -7178,6 +7296,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "next_retry": time.monotonic() + 30,
                         }
             except Exception as e:
+                self._update_adapter_runtime_inventory(
+                    _active_profile,
+                    platform.value,
+                    connected=False,
+                    authenticated=False,
+                    error=type(e),
+                )
                 logger.error("✗ %s error: %s", platform.value, e)
                 # Same defensive cleanup path for exceptions — an adapter
                 # that raised mid-connect may still have a live
@@ -7926,12 +8051,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     adapter = self._create_adapter(platform, platform_config)
                     if not adapter:
+                        from gateway.adapter_runtime import AdapterUnavailableError
+
+                        self._update_adapter_runtime_inventory(
+                            self._active_profile_name(),
+                            platform.value,
+                            connected=False,
+                            authenticated=False,
+                            error=AdapterUnavailableError,
+                        )
                         logger.warning(
                             "Reconnect %s: adapter creation returned None, removing from retry queue",
                             platform.value,
                         )
                         del self._failed_platforms[platform]
                         continue
+
+                    self._bind_adapter_runtime_inventory(
+                        adapter,
+                        profile=self._active_profile_name(),
+                        platform=platform,
+                    )
 
                     adapter.set_message_handler(self._handle_message)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
@@ -7952,6 +8092,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
+                        self._update_adapter_runtime_inventory(
+                            self._active_profile_name(),
+                            platform.value,
+                            connected=True,
+                            authenticated=True,
+                        )
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="connected",
@@ -7983,6 +8129,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
+                        from gateway.adapter_runtime import AdapterFatalError
+
+                        self._update_adapter_runtime_inventory(
+                            self._active_profile_name(),
+                            platform.value,
+                            connected=False,
+                            authenticated=False,
+                            error=AdapterFatalError,
+                        )
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="fatal",
@@ -8004,6 +8159,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await _dispose_unused_adapter(adapter)
                         del self._failed_platforms[platform]
                     else:
+                        from gateway.adapter_runtime import (
+                            AdapterConnectError,
+                            AdapterFatalError,
+                        )
+
+                        self._update_adapter_runtime_inventory(
+                            self._active_profile_name(),
+                            platform.value,
+                            connected=False,
+                            authenticated=False,
+                            error=(
+                                AdapterFatalError
+                                if adapter.has_fatal_error
+                                else AdapterConnectError
+                            ),
+                        )
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying",
@@ -8034,6 +8205,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # `not fatal_error_retryable` branch above, so anything
                         # reaching here is by definition retryable.
                 except Exception as e:
+                    self._update_adapter_runtime_inventory(
+                        self._active_profile_name(),
+                        platform.value,
+                        connected=False,
+                        authenticated=False,
+                        error=type(e),
+                    )
                     if adapter is not None:
                         # An exception escaping the connect call path
                         # (DNS timeout, aiohttp server.start() crash, etc.)
@@ -8312,12 +8490,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
+                self._record_adapter_runtime_event(
+                    self._active_profile_name(), platform.value, "stopped"
+                )
 
             # Disconnect secondary-profile adapters (multiplex mode).
             for _prof, _amap in list(getattr(self, "_profile_adapters", {}).items()):
                 for platform, adapter in list(_amap.items()):
                     await self._bounded_adapter_teardown(
                         adapter, platform, profile=_prof
+                    )
+                    self._record_adapter_runtime_event(
+                        _prof, platform.value, "stopped"
                     )
                 _amap.clear()
             if hasattr(self, "_profile_adapters"):
@@ -8598,6 +8782,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profile_map = self._profile_adapters.setdefault(profile_name, {})
         connected = 0
         for platform, platform_config in profile_cfg.platforms.items():
+            self._update_adapter_runtime_inventory(
+                profile_name,
+                platform.value,
+                configured=True,
+                enabled=bool(platform_config.enabled),
+                connected=False,
+                authenticated=False,
+                clear_error=True,
+            )
             if not platform_config.enabled:
                 continue
             # A secondary profile must NOT enable a port-binding platform: the
@@ -8605,6 +8798,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /p/<profile>/ prefix, so a second bind can only collide. This is a
             # config error, not a transient failure — fail fast and loud.
             if platform.value in _PORT_BINDING_PLATFORM_VALUES:
+                from gateway.adapter_runtime import MultiplexAdapterConfigError
+
+                self._update_adapter_runtime_inventory(
+                    profile_name,
+                    platform.value,
+                    error=MultiplexAdapterConfigError,
+                )
                 raise MultiplexConfigError(
                     f"Profile '{profile_name}' enables the port-binding platform "
                     f"'{platform.value}', but gateway.multiplex_profiles is on. The "
@@ -8618,13 +8818,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             with _profile_runtime_scope(profile_home):
                 adapter = self._create_adapter(platform, platform_config)
             if not adapter:
+                from gateway.adapter_runtime import AdapterUnavailableError
+
+                self._update_adapter_runtime_inventory(
+                    profile_name,
+                    platform.value,
+                    error=AdapterUnavailableError,
+                )
                 continue
+
+            self._bind_adapter_runtime_inventory(
+                adapter, profile=profile_name, platform=platform
+            )
 
             # Same-token conflict detection — refuse a duplicate poll.
             fp = self._adapter_credential_fingerprint(adapter)
             if fp is not None:
                 owner = claimed.get((platform, fp))
                 if owner is not None:
+                    from gateway.adapter_runtime import DuplicateCredentialError
+
+                    self._update_adapter_runtime_inventory(
+                        profile_name,
+                        platform.value,
+                        connected=False,
+                        authenticated=False,
+                        error=DuplicateCredentialError,
+                    )
                     logger.error(
                         "Profile '%s' and '%s' both configure %s with the same "
                         "credential — refusing to start the duplicate (a single "
@@ -8654,11 +8874,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if success:
                     profile_map[platform] = adapter
                     connected += 1
+                    self._update_adapter_runtime_inventory(
+                        profile_name,
+                        platform.value,
+                        connected=True,
+                        authenticated=True,
+                    )
                     logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
                 else:
+                    from gateway.adapter_runtime import (
+                        AdapterConnectError,
+                        AdapterFatalError,
+                    )
+
+                    self._update_adapter_runtime_inventory(
+                        profile_name,
+                        platform.value,
+                        connected=False,
+                        authenticated=False,
+                        error=(
+                            AdapterFatalError
+                            if getattr(adapter, "has_fatal_error", False)
+                            else AdapterConnectError
+                        ),
+                    )
                     logger.warning("✗ %s failed to connect (profile: %s)", platform.value, profile_name)
                     await self._safe_adapter_disconnect(adapter, platform)
             except Exception as e:
+                self._update_adapter_runtime_inventory(
+                    profile_name,
+                    platform.value,
+                    connected=False,
+                    authenticated=False,
+                    error=type(e),
+                )
                 logger.error("✗ %s error (profile: %s): %s", platform.value, profile_name, e)
                 await self._safe_adapter_disconnect(adapter, platform)
         return connected
