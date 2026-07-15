@@ -4007,7 +4007,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if should_deliver:
                 try:
                     deliver_kwargs = {"adapters": adapters, "loop": loop}
-                    if _delivery_evidence:
+                    # Producer evidence identifies a successful briefing artifact,
+                    # never a scheduler/agent failure alert.  Reusing it on the
+                    # failure path would let a delivered error message consume the
+                    # artifact's native `sent` receipt and suppress the real report
+                    # on retry.
+                    if _delivery_evidence and success:
                         deliver_kwargs["delivery_evidence"] = _delivery_evidence[0]
                     delivery_error = _deliver_result(
                         job,
