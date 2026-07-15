@@ -15,10 +15,13 @@ import contextvars
 import json
 import logging
 import os
+import queue
 import re
+import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -277,7 +280,16 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim, update_job
+from cron.jobs import (
+    _cron_inactivity_timeout_seconds,
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+    advance_next_run,
+    claim_dispatch,
+    heartbeat_run_claim,
+    update_job,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -2400,6 +2412,8 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
+_DEFAULT_SCRIPT_STALL_TIMEOUT = 0  # disabled unless configured
+_SCRIPT_STALL_TIMEOUT = _DEFAULT_SCRIPT_STALL_TIMEOUT
 
 
 def _get_script_timeout() -> int:
@@ -2493,7 +2507,101 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _get_script_stall_timeout() -> float:
+    """Resolve the no-output stall ceiling; zero disables stall detection."""
+    if _SCRIPT_STALL_TIMEOUT != _DEFAULT_SCRIPT_STALL_TIMEOUT:
+        try:
+            timeout = float(_SCRIPT_STALL_TIMEOUT)
+            if timeout >= 0:
+                return timeout
+        except Exception:
+            logger.warning(
+                "Invalid patched _SCRIPT_STALL_TIMEOUT=%r; using config/default",
+                _SCRIPT_STALL_TIMEOUT,
+            )
+
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        configured = cron_cfg.get("script_stall_timeout_seconds")
+        if configured is not None:
+            timeout = float(configured)
+            if timeout >= 0:
+                return timeout
+    except Exception as exc:
+        logger.debug("Failed to load cron script stall timeout from config: %s", exc)
+    return float(_DEFAULT_SCRIPT_STALL_TIMEOUT)
+
+
+def _process_start_identity(pid: int) -> str | None:
+    """Return Linux process start ticks when available, preventing PID reuse."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        tail = raw[raw.rfind(")") + 2 :].split()
+        return tail[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _write_script_progress(progress_key: str | None, payload: dict) -> None:
+    """Atomically publish non-authoritative, owner-only script telemetry."""
+    if not progress_key:
+        return
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(progress_key)).strip(".-")
+    if not safe_key:
+        return
+    directory = _get_hermes_home() / "cron" / "progress"
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    target = directory / f"{safe_key}.json"
+    fd, temporary = tempfile.mkstemp(prefix=f".{safe_key}.", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _stop_script_process(proc: subprocess.Popen, grace_seconds: float = 10.0) -> None:
+    """Terminate the script and its process group, then escalate after grace."""
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=grace_seconds)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+        proc.wait(timeout=grace_seconds)
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("Cron script process %s did not exit after forced stop", proc.pid)
+
+
+def _run_job_script(
+    script_path: str,
+    *,
+    progress_key: str | None = None,
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -2580,26 +2688,126 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
-        popen_kwargs = {}
         if sys.platform == "win32":
             popen_kwargs = {
                 "creationflags": windows_hide_flags(),
                 "encoding": "utf-8",
                 "errors": "replace",
             }
+        else:
+            # start_new_session=True isolates the script in its own process
+            # group so the stall/timeout watchdog (_stop_script_process) can
+            # terminate the whole tree via os.killpg.
+            popen_kwargs = {"start_new_session": True}
         env = _sanitize_subprocess_env(os.environ.copy())
         env.update(env_overlay)
-        result = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=script_timeout,
+            bufsize=1,
             cwd=str(path.parent),
             env=env,
             **popen_kwargs,
         )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        started_mono = last_output_mono = last_publish_mono = time.monotonic()
+        started_at = _hermes_now().isoformat()
+        stall_timeout = _get_script_stall_timeout()
+        events: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        output_events = 0
+
+        def _reader(label: str, stream) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    events.put((label, line))
+            finally:
+                events.put((label, None))
+                stream.close()
+
+        readers = [
+            threading.Thread(target=_reader, args=("stdout", proc.stdout), daemon=True),
+            threading.Thread(target=_reader, args=("stderr", proc.stderr), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+
+        base_progress = {
+            "schema": "hermes.cron-script-progress.v1",
+            "job_id": progress_key,
+            "script": path.name,
+            "pid": proc.pid,
+            "pid_start_ticks": _process_start_identity(proc.pid),
+            "started_at": started_at,
+        }
+
+        def _publish(status: str, **extra) -> None:
+            now = _hermes_now().isoformat()
+            _write_script_progress(progress_key, {
+                **base_progress,
+                "status": status,
+                "heartbeat_at": now,
+                "last_output_at": extra.pop("last_output_at", now if output_events else None),
+                "output_events": output_events,
+                **extra,
+            })
+
+        _publish("running", last_output_at=None)
+        terminal_reason: str | None = None
+        last_output_at: str | None = None
+        while True:
+            now_mono = time.monotonic()
+            wait_for = min(0.25, max(0.01, script_timeout - (now_mono - started_mono)))
+            try:
+                label, line = events.get(timeout=wait_for)
+                if line is not None:
+                    if label == "stdout":
+                        stdout_parts.append(line)
+                    else:
+                        stderr_parts.append(line)
+                    output_events += 1
+                    last_output_mono = time.monotonic()
+                    last_output_at = _hermes_now().isoformat()
+                    _publish("running", last_output_at=last_output_at)
+                    last_publish_mono = last_output_mono
+            except queue.Empty:
+                pass
+
+            now_mono = time.monotonic()
+            if proc.poll() is not None:
+                break
+            if now_mono - last_publish_mono >= 5.0:
+                _publish("running", last_output_at=last_output_at)
+                last_publish_mono = now_mono
+            if now_mono - started_mono >= script_timeout:
+                terminal_reason = "timeout"
+                _stop_script_process(proc)
+                break
+            if stall_timeout > 0 and now_mono - last_output_mono >= stall_timeout:
+                terminal_reason = "stalled"
+                _stop_script_process(proc)
+                break
+
+        for reader in readers:
+            reader.join(timeout=1.0)
+        while True:
+            try:
+                label, line = events.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                continue
+            if label == "stdout":
+                stdout_parts.append(line)
+            else:
+                stderr_parts.append(line)
+            output_events += 1
+            last_output_at = _hermes_now().isoformat()
+
+        stdout = "".join(stdout_parts).strip()
+        stderr = "".join(stderr_parts).strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -2611,18 +2819,24 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
 
-        if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+        if terminal_reason == "timeout":
+            _publish("timed_out", last_output_at=last_output_at, completed_at=_hermes_now().isoformat(), exit_code=proc.returncode)
+            return False, f"Script timed out after {script_timeout}s: {path}"
+        if terminal_reason == "stalled":
+            _publish("stalled", last_output_at=last_output_at, completed_at=_hermes_now().isoformat(), exit_code=proc.returncode)
+            return False, f"Script stalled with no output for {stall_timeout:g}s: {path}"
+
+        if proc.returncode != 0:
+            _publish("failed", last_output_at=last_output_at, completed_at=_hermes_now().isoformat(), exit_code=proc.returncode)
+            parts = [f"Script exited with code {proc.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
             return False, "\n".join(parts)
 
+        _publish("complete", last_output_at=last_output_at, completed_at=_hermes_now().isoformat(), exit_code=proc.returncode)
         return True, stdout
-
-    except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
@@ -2642,6 +2856,10 @@ def _run_job_script_with_claim_heartbeat(
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
+    # Owner-only progress-telemetry key, threaded into every _run_job_script
+    # call below so streaming/stall detection publishes regardless of whether
+    # this job takes the claim-heartbeat path or the plain path.
+    _progress_key = str(job.get("id") or "") or None
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -2650,7 +2868,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, progress_key=_progress_key)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2681,10 +2899,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, progress_key=_progress_key)
 
     try:
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, progress_key=_progress_key)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -2753,7 +2971,9 @@ def _build_job_prompt(
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path, progress_key=job.get("id")
+            )
         if success:
             from cron.delivery_receipts import extract_delivery_evidence
 
@@ -3785,22 +4005,13 @@ def run_job(
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
         # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
+        # Configure with cron.agent_inactivity_timeout_seconds. The legacy
+        # HERMES_CRON_TIMEOUT env var remains a higher-precedence bridge.
+        # 0 = unlimited.
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-        if _raw_cron_timeout:
-            try:
-                _cron_timeout = float(_raw_cron_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
-                    _raw_cron_timeout,
-                )
-                _cron_timeout = 600.0
-        else:
-            _cron_timeout = 600.0
+        _cron_timeout = _cron_inactivity_timeout_seconds()
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
         # Keep the one-shot run_claim fresh while the run is alive (#62002):

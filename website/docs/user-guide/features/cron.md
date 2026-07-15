@@ -423,9 +423,11 @@ Pre-run scripts (attached via the `script` parameter) have a default timeout of 
 # ~/.hermes/config.yaml
 cron:
   script_timeout_seconds: 1800   # 30 minutes
+  script_stall_timeout_seconds: 300  # fail after 5 minutes without output
+  agent_inactivity_timeout_seconds: 900  # agent jobs: 15 idle minutes
 ```
 
-Or set the `HERMES_CRON_SCRIPT_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 3600s default.
+Or set the backward-compatible `HERMES_CRON_SCRIPT_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 3600s default. Keep the stall ceiling below the hard ceiling and make long crawlers emit periodic progress; polling `cron/progress/<job-id>.json` is read-only and must never retrigger the script.
 
 ## No-agent mode (script-only jobs)
 
