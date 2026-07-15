@@ -2842,6 +2842,18 @@ DEFAULT_CONFIG = {
         # wedges the job's dispatch guard forever. Also overridable via
         # HERMES_CRON_SESSION_DB_TIMEOUT env var. 0 = unlimited (skip the bound).
         "session_db_timeout_seconds": 10,
+        # Hard wall-clock ceiling for no-agent and pre-run scripts. Individual
+        # pipelines should retain tighter stage/item budgets below this guard.
+        "script_timeout_seconds": 3600,
+        # Fail a live script that produces no stdout/stderr progress for this
+        # many seconds. Zero disables the stall detector. The process group is
+        # terminated without retriggering; the next schedule/operator decides
+        # whether a new attempt is safe.
+        "script_stall_timeout_seconds": 0,
+        # Inactivity ceiling for agent-backed cron jobs. Active tool calls and
+        # stream deltas refresh the lease, so deep work can outlive this value;
+        # a silent/hung agent cannot. Zero disables the watchdog.
+        "agent_inactivity_timeout_seconds": 600,
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that

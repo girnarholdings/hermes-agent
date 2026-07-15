@@ -193,6 +193,27 @@ _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 _DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
 
 
+def _cron_inactivity_timeout_seconds() -> float:
+    """Resolve agent-cron inactivity from env, then profile config, then default."""
+    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return _DEFAULT_CRON_INACTIVITY_TIMEOUT
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        cron_config = config.get("cron", {}) if isinstance(config, dict) else {}
+        configured = cron_config.get("agent_inactivity_timeout_seconds")
+        if configured is not None:
+            return float(configured)
+    except (ImportError, TypeError, ValueError):
+        pass
+    return _DEFAULT_CRON_INACTIVITY_TIMEOUT
+
+
 def _oneshot_run_claim_ttl_seconds() -> float:
     """Resolve the one-shot running-claim stale-recovery TTL.
 
@@ -206,13 +227,7 @@ def _oneshot_run_claim_ttl_seconds() -> float:
     - positive N → ``max(N * headroom, ONESHOT_RUN_CLAIM_TTL_SECONDS)`` so a
       tiny configured timeout can never expire a claim mid-run.
     """
-    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-    timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
-    if raw:
-        try:
-            timeout = float(raw)
-        except (ValueError, TypeError):
-            timeout = _DEFAULT_CRON_INACTIVITY_TIMEOUT
+    timeout = _cron_inactivity_timeout_seconds()
     if timeout <= 0:
         # Unlimited runs — cannot bound; use the fixed fallback floor.
         return float(ONESHOT_RUN_CLAIM_TTL_SECONDS)
