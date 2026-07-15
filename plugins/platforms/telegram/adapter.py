@@ -2785,6 +2785,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if getattr(self, "_polling_teardown_started", False):
             return
+        self._notify_adapter_runtime("poll_error", type(error))
         if self.has_fatal_error:
             return
         if self._polling_error_task and not self._polling_error_task.done():
@@ -2947,6 +2948,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # callback instead of the (now finished) cold-start gate.
                 strict_gate_open = False
                 self._polling_error_callback_ref = error_callback
+            self._notify_adapter_runtime("poll_success")
             return True
         except _PollingLifecycleAbort:
             return False
@@ -2985,6 +2987,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if getattr(self, "_polling_teardown_started", False):
             return
+        self._notify_adapter_runtime("poll_error", type(error))
         if self.has_fatal_error:
             return
 
@@ -3077,6 +3080,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 "health pending getUpdates progress",
                 self.name, attempt,
             )
+            # Observability only: start_polling restarted. Recovery-state
+            # mutations (counter reset, _send_path_degraded clear, deferred
+            # probe) were relocated upstream into _record_polling_progress,
+            # which fires on real getUpdates progress — do NOT re-introduce them
+            # here (that would clear degraded before actual recovery).
+            self._notify_adapter_runtime("poll_success")
         except _PollingLifecycleAbort:
             return
         except Exception as retry_err:
@@ -3204,6 +3213,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # a single in-flight update (consumed before the next probe)
                 # never trips recovery.
                 await self._probe_pending_updates(bot, PROBE_TIMEOUT)
+                self._notify_adapter_runtime("poll_success")
             except asyncio.CancelledError:
                 return
             except (asyncio.TimeoutError, OSError) as probe_err:
@@ -3376,6 +3386,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             await asyncio.wait_for(app.bot.get_me(), PROBE_TIMEOUT)
+            # Observability only. Upstream defers the _send_path_degraded clear
+            # to _record_polling_progress (real getUpdates progress), so the
+            # get_me probe success no longer clears the degraded flag here.
+            self._notify_adapter_runtime("poll_success")
         except Exception as probe_err:
             if getattr(self, "_polling_teardown_started", False):
                 return
@@ -3481,6 +3495,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_polling_conflict(self, error: Exception) -> None:
         if getattr(self, "_polling_teardown_started", False):
             return
+        self._notify_adapter_runtime("poll_error", type(error))
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
             return
         # Transient 409 Conflict errors arise when the previous gateway process
@@ -3587,6 +3602,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     "health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
                 )
+                # Observability only; the _polling_conflict_count reset was
+                # relocated upstream into _record_polling_progress.
+                self._notify_adapter_runtime("poll_success")
                 return
             except _PollingLifecycleAbort:
                 return
@@ -4605,6 +4623,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         # timeout pattern in agent/auxiliary_client.py).
                         on_abandon=lambda app=self._app: _shutdown_abandoned_app(app),
                     )
+                    # PTB initialize() authenticates the bot via get_me().
+                    self._notify_adapter_runtime("authenticated")
                     break
                 except asyncio.TimeoutError:
                     rebuild_app = True
@@ -4778,6 +4798,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 def _polling_error_callback(error: Exception) -> None:
                     if getattr(self, "_polling_teardown_started", False):
                         return
+                    self._notify_adapter_runtime("poll_error", type(error))
                     if self._polling_error_task and not self._polling_error_task.done():
                         return
                     if self._looks_like_polling_conflict(error):
