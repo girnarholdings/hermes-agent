@@ -13,12 +13,39 @@ import sys
 import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+
+def _make_fake_popen(captured, *, stdout="ok\n", stderr="", returncode=0):
+    """Build a subprocess.Popen stand-in that records argv/kwargs.
+
+    _run_job_script streams output through a reader thread over ``proc.stdout``/
+    ``proc.stderr`` (it uses ``subprocess.Popen``, not ``subprocess.run``), so
+    the fake exposes readable text streams plus poll()/wait(). The captured
+    argv/kwargs still let callers assert interpreter/env/creationflags choices.
+    """
+    import io
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            self.pid = 4321
+            self.returncode = returncode
+            self.stdout = io.StringIO(stdout)
+            self.stderr = io.StringIO(stderr)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    return _FakeProc
 
 
 @pytest.fixture
@@ -194,15 +221,10 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", _make_fake_popen(captured))
 
         success, output = _run_job_script("probe.py")
 
@@ -231,15 +253,10 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(pythonw))
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", _make_fake_popen(captured))
 
         success, output = _run_job_script("probe.py")
 
@@ -258,13 +275,8 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", _make_fake_popen(captured))
 
         success, output = _run_job_script("probe.py")
 
