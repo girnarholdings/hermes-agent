@@ -163,7 +163,9 @@ async def test_auth_failure_records_class_only_and_never_exception_text(
     monkeypatch.setattr("gateway.config.load_gateway_config", lambda: profile_cfg)
     monkeypatch.setattr(runner, "_create_adapter", lambda _p, _c: adapter)
     monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _fail_connect)
-    monkeypatch.setattr(runner, "_make_adapter_auth_check", lambda _p: None)
+    monkeypatch.setattr(
+        runner, "_make_adapter_auth_check", lambda _p, profile_name=None: None
+    )
     monkeypatch.setattr(runner, "_adapter_disconnect_timeout_secs", lambda: 0)
 
     connected = await runner._start_one_profile_adapters(

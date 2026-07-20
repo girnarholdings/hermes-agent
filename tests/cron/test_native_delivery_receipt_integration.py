@@ -425,7 +425,7 @@ def test_no_agent_marker_survives_run_job_and_is_removed_from_delivery_text(
     monkeypatch.setattr(
         scheduler,
         "_run_job_script",
-        lambda _path: (True, f"{marker}\nScreener report"),
+        lambda _path, progress_key=None: (True, f"{marker}\nScreener report"),
     )
     evidence = []
 
@@ -463,7 +463,7 @@ def test_build_job_prompt_extracts_evidence_before_prompt_injection(monkeypatch)
     monkeypatch.setattr(
         scheduler,
         "_run_job_script",
-        lambda _path: (True, f"{marker}\nproducer data"),
+        lambda _path, progress_key=None: (True, f"{marker}\nproducer data"),
     )
     evidence = []
 
