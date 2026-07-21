@@ -2578,9 +2578,13 @@ def _stop_script_process(proc: subprocess.Popen, grace_seconds: float = 10.0) ->
     """Terminate the script and its process group, then escalate after grace."""
     if proc.poll() is not None:
         return
+    # Windows has no process groups and no SIGKILL; resolve both via getattr so
+    # the fallback path (plain terminate/kill) engages there. Same POSIX behavior.
+    _killpg = getattr(os, "killpg", None)
+    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
     try:
-        if os.name == "posix":
-            os.killpg(proc.pid, signal.SIGTERM)
+        if _killpg is not None:
+            _killpg(proc.pid, signal.SIGTERM)
         else:
             proc.terminate()
         proc.wait(timeout=grace_seconds)
@@ -2588,8 +2592,8 @@ def _stop_script_process(proc: subprocess.Popen, grace_seconds: float = 10.0) ->
     except (OSError, subprocess.TimeoutExpired):
         pass
     try:
-        if os.name == "posix":
-            os.killpg(proc.pid, signal.SIGKILL)
+        if _killpg is not None:
+            _killpg(proc.pid, _sigkill)
         else:
             proc.kill()
         proc.wait(timeout=grace_seconds)
