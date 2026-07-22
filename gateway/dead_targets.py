@@ -45,6 +45,19 @@ def _normalize(platform: str, chat_id: str) -> str:
     return f"{str(platform).strip().lower()}:{str(chat_id).strip()}"
 
 
+def _active_profile_name() -> str:
+    """Best-effort active profile name for operator-facing dead-target logs.
+
+    Degrades to ``"default"`` if the profile subsystem is unavailable (e.g. a
+    standalone/cron context) so logging never breaks the delivery path.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
 class DeadTargetRegistry:
     """Thread-safe, persistent set of confirmed-dead delivery targets.
 
@@ -117,10 +130,18 @@ class DeadTargetRegistry:
             }
             self._flush_locked()
         if not existed:
-            logger.info(
-                "dead_targets: marked %s as unreachable (%s) — future deliveries "
-                "to this target will be skipped until a send succeeds",
-                key, reason or "no reason given",
+            # Loud, grep-able operator alert. A newly-dead target means every
+            # future delivery to it is silently skipped until a send succeeds,
+            # so surface it at WARNING (reaches errors.log — the gateway's
+            # operator-visible alert surface) rather than the previous INFO,
+            # which never made it into errors.log. Grep key: "DEAD-TARGET:".
+            logger.warning(
+                "DEAD-TARGET: profile=%s platform=%s chat=%s reason=%s — "
+                "deliveries will be skipped until a send to this target succeeds",
+                _active_profile_name(),
+                str(platform).strip().lower(),
+                chat_id,
+                reason or "no reason given",
             )
         return not existed
 
@@ -133,7 +154,16 @@ class DeadTargetRegistry:
             if key in self._dead:
                 del self._dead[key]
                 self._flush_locked()
-                logger.info("dead_targets: cleared %s (delivery succeeded again)", key)
+                # Self-heal recovery — INFO so operators can confirm a
+                # previously-dead target came back. Grep key:
+                # "DEAD-TARGET RECOVERED:".
+                logger.info(
+                    "DEAD-TARGET RECOVERED: profile=%s platform=%s chat=%s — "
+                    "delivery succeeded again, resuming normal delivery",
+                    _active_profile_name(),
+                    str(platform).strip().lower(),
+                    chat_id,
+                )
                 return True
         return False
 
