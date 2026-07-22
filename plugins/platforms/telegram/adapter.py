@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import html as _html
+import random
 import re
 import threading
 import time
@@ -568,6 +569,32 @@ _POLLING_ERROR_TASK_STUCK_TIMEOUT = 300.0
 _POLLING_PROGRESS_TIMEOUT = 60.0
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
     "telegram_polling_generation", default=None
+)
+
+
+def _telegram_env_float(name: str, default: float) -> float:
+    """Read a float tunable from the environment, degrading to *default* on bad input."""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Flood-control ("RetryAfter") send budget.
+#
+# Telegram dictates a server ``retry_after`` on flood control. On 2026-07-19 the
+# server returned retry_after values of 249-255s; the previous fixed 3-attempt
+# cap raised on attempt 3 (``Flood control exceeded. Retry in 255 seconds``) and
+# the message was dropped. Instead of a fixed attempt count, flood/RetryAfter
+# errors keep honoring the server's retry_after (plus a little jitter, so
+# concurrent senders don't re-collide in lockstep) until this total wall-clock
+# budget is exhausted. Non-flood transient/network errors keep the classic
+# 3-attempt behavior. Override via the env vars below.
+_TELEGRAM_SEND_FLOOD_BUDGET_SECONDS = _telegram_env_float(
+    "TELEGRAM_SEND_FLOOD_BUDGET_SECONDS", 600.0
+)
+_TELEGRAM_SEND_FLOOD_JITTER_SECONDS = _telegram_env_float(
+    "TELEGRAM_SEND_FLOOD_JITTER_SECONDS", 1.0
 )
 
 
@@ -4167,7 +4194,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
                 msg = None
-                for _send_attempt in range(3):
+                # Network/transient errors keep the classic 3-attempt cap;
+                # flood-control (RetryAfter) errors instead honor the server's
+                # retry_after until a wall-clock budget is exhausted (see
+                # _TELEGRAM_SEND_FLOOD_BUDGET_SECONDS). The two are tracked
+                # separately so a long flood wait never consumes a network
+                # retry, and vice versa. Loop termination: network retries are
+                # bounded by _net_attempt (<=3), flood retries by the deadline,
+                # and the thread-not-found / reply-deleted paths by their own
+                # one-shot flags below.
+                _net_attempt = 0
+                _flood_deadline = None
+                while True:
                     try:
                         # Try Markdown first, fall back to plain text if it fails
                         try:
@@ -4291,29 +4329,50 @@ class TelegramAdapter(BasePlatformAdapter):
                             raise
                         if is_pool_timeout:
                             await self._drain_general_connections_after_pool_timeout()
-                        if _send_attempt < 2:
-                            wait = 2 ** _send_attempt
+                        if _net_attempt < 2:
+                            wait = 2 ** _net_attempt
                             safe_send_error = _redact_telegram_error_text(send_err)
                             logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
-                                           self.name, _send_attempt + 1, wait, safe_send_error)
+                                           self.name, _net_attempt + 1, wait, safe_send_error)
                             await asyncio.sleep(wait)
+                            _net_attempt += 1
                         else:
                             raise
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
-                            if _send_attempt < 2:
-                                wait = float(retry_after) if retry_after is not None else 1.0
-                                safe_send_error = _redact_telegram_error_text(send_err)
+                            _now = time.monotonic()
+                            if _flood_deadline is None:
+                                _flood_deadline = _now + _TELEGRAM_SEND_FLOOD_BUDGET_SECONDS
+                            wait = float(retry_after) if retry_after is not None else 1.0
+                            wait += random.uniform(0.0, _TELEGRAM_SEND_FLOOD_JITTER_SECONDS)
+                            safe_send_error = _redact_telegram_error_text(send_err)
+                            # Honor the server's retry_after as long as the next
+                            # wait still finishes inside the budget window. This
+                            # replaces the old 3-attempt cap that dropped the
+                            # message when retry_after (249-255s observed
+                            # 2026-07-19) pushed attempt 3 past the ceiling.
+                            if _now + wait <= _flood_deadline:
+                                _budget = int(_TELEGRAM_SEND_FLOOD_BUDGET_SECONDS)
+                                _remaining = max(_flood_deadline - _now, 0.0)
                                 logger.warning(
-                                    "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
+                                    "[%s] Telegram flood control on send "
+                                    "(retrying in %.1fs, %.0fs of %ds budget left): %s",
                                     self.name,
-                                    _send_attempt + 1,
                                     wait,
+                                    _remaining,
+                                    _budget,
                                     safe_send_error,
                                 )
                                 await asyncio.sleep(wait)
                                 continue
+                            logger.error(
+                                "[%s] Telegram flood control on send: %ds retry "
+                                "budget exhausted, giving up: %s",
+                                self.name,
+                                int(_TELEGRAM_SEND_FLOOD_BUDGET_SECONDS),
+                                safe_send_error,
+                            )
                         raise
                 message_ids.append(str(msg.message_id))
 

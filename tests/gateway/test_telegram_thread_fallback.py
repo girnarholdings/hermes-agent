@@ -1528,3 +1528,72 @@ async def test_send_retries_retry_after_errors():
     assert result.success is True
     assert result.message_id == "300"
     assert attempt[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_send_flood_retries_beyond_three_attempts_within_budget(monkeypatch):
+    """Flood control keeps retrying past the old 3-attempt cap while inside the
+    wall-clock budget (regression for 2026-07-19 drops on attempt 3 when the
+    server dictated retry_after=249-255s)."""
+    from plugins.platforms.telegram import adapter as tg_adapter
+
+    # Deterministic: no real sleeps, controllable clock, zero jitter.
+    clock = [1000.0]
+    monkeypatch.setattr(tg_adapter.time, "monotonic", lambda: clock[0])
+
+    async def fake_sleep(delay):
+        clock[0] += delay
+
+    monkeypatch.setattr(tg_adapter.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(tg_adapter.random, "uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(tg_adapter, "_TELEGRAM_SEND_FLOOD_BUDGET_SECONDS", 600.0)
+
+    adapter = _make_adapter()
+    attempt = [0]
+
+    async def mock_send_message(**kwargs):
+        attempt[0] += 1
+        if attempt[0] <= 5:  # 5 floods x 100s = 500s < 600s budget
+            raise FakeRetryAfter(100)
+        return SimpleNamespace(message_id=301)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(chat_id="123", content="flood then ok")
+
+    assert result.success is True
+    assert result.message_id == "301"
+    assert attempt[0] == 6  # 5 retries past the old cap of 3
+
+
+@pytest.mark.asyncio
+async def test_send_flood_gives_up_after_budget_exhausted(monkeypatch):
+    """When the next server-dictated wait would exceed the budget, the send gives
+    up (returns failure) instead of retrying forever."""
+    from plugins.platforms.telegram import adapter as tg_adapter
+
+    clock = [1000.0]
+    monkeypatch.setattr(tg_adapter.time, "monotonic", lambda: clock[0])
+
+    async def fake_sleep(delay):
+        clock[0] += delay
+
+    monkeypatch.setattr(tg_adapter.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(tg_adapter.random, "uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(tg_adapter, "_TELEGRAM_SEND_FLOOD_BUDGET_SECONDS", 300.0)
+
+    adapter = _make_adapter()
+    attempt = [0]
+
+    async def mock_send_message(**kwargs):
+        attempt[0] += 1
+        raise FakeRetryAfter(200)  # 200s each; budget 300 -> one retry then stop
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(chat_id="123", content="always flooded")
+
+    assert result.success is False
+    # t0=1000, deadline=1300. attempt1 wait 200 -> 1200<=1300 (sleep).
+    # attempt2 now 1200 wait 200 -> 1400>1300 -> give up. Exactly 2 sends.
+    assert attempt[0] == 2

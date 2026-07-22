@@ -64,6 +64,49 @@ class TestDeadTargetRegistry:
         reg2 = DeadTargetRegistry()
         assert reg2.is_dead("telegram", "999") is True
 
+    def test_mark_dead_emits_grepable_warning(self, isolate, caplog):
+        """Marking a target dead must emit a loud, grep-able WARNING (reaches
+        errors.log) so the operator learns deliveries are being skipped."""
+        import logging
+
+        reg = DeadTargetRegistry()
+        with caplog.at_level(logging.WARNING, logger="gateway.dead_targets"):
+            assert (
+                reg.mark_dead("telegram", "-100999", "forbidden: bot was kicked")
+                is True
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        hits = [m for m in warnings if "DEAD-TARGET:" in m]
+        assert hits, f"no DEAD-TARGET warning emitted; got {warnings!r}"
+        assert "chat=-100999" in hits[0]
+        assert "forbidden" in hits[0]
+
+        # Idempotent: re-marking an already-dead target does NOT re-warn.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="gateway.dead_targets"):
+            assert reg.mark_dead("telegram", "-100999", "forbidden") is False
+        assert not [
+            r for r in caplog.records if "DEAD-TARGET:" in r.getMessage()
+        ]
+
+    def test_self_heal_emits_recovered_info(self, isolate, caplog):
+        """A successful send after death clears the flag and logs a grep-able
+        recovery line at INFO."""
+        import logging
+
+        reg = DeadTargetRegistry()
+        reg.mark_dead("telegram", "-100999", "forbidden")
+        with caplog.at_level(logging.INFO, logger="gateway.dead_targets"):
+            assert reg.clear("telegram", "-100999") is True
+
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            "DEAD-TARGET RECOVERED:" in m and "chat=-100999" in m for m in msgs
+        ), f"no recovery INFO emitted; got {msgs!r}"
+
     def test_key_is_case_insensitive_on_platform(self, isolate):
         reg = DeadTargetRegistry()
         reg.mark_dead("TeleGram", "5", "x")

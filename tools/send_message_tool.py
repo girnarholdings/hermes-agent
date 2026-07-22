@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import ssl
 import time
@@ -81,6 +82,29 @@ _CAPTIONABLE_EXTS = _IMAGE_EXTS | _VIDEO_EXTS | {
 # more generous, so a conservative shared ceiling keeps behavior predictable.
 _TELEGRAM_CAPTION_LIMIT = 1024
 _DEFAULT_CAPTION_LIMIT = 4096
+
+
+def _telegram_env_float(name: str, default: float) -> float:
+    """Read a float tunable from the environment, degrading to *default* on bad input."""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Flood-control ("RetryAfter") send budget for the standalone send path. Mirrors
+# the gateway adapter's knob (plugins/platforms/telegram/adapter.py): on flood
+# control the server dictates a retry_after (249s observed 2026-07-19 in the
+# standalone _send_telegram path); the previous fixed 3-attempt cap dropped the
+# message. Flood errors now retry — honoring retry_after plus a little jitter —
+# until this wall-clock budget is spent. Non-flood transient errors keep the
+# 3-attempt cap. Override via the same env vars the adapter reads.
+_TELEGRAM_SEND_FLOOD_BUDGET_SECONDS = _telegram_env_float(
+    "TELEGRAM_SEND_FLOOD_BUDGET_SECONDS", 600.0
+)
+_TELEGRAM_SEND_FLOOD_JITTER_SECONDS = _telegram_env_float(
+    "TELEGRAM_SEND_FLOOD_JITTER_SECONDS", 1.0
+)
 
 
 def _media_caption_split(text, media_files, *, max_caption_len):
@@ -172,18 +196,81 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
         or "503" in text
         or "gateway timeout" in text
         or "504" in text
+        or "flood control" in text
+        or "retry after" in text
     ):
         return float(2 ** attempt)
     return None
 
 
-async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs):
-    for attempt in range(attempts):
+def _is_telegram_flood_error(exc: Exception) -> bool:
+    """True when *exc* is a Telegram flood-control / RetryAfter error.
+
+    These carry a server-dictated ``retry_after`` (or say "flood control" /
+    "retry after" in their text). They are retried on a wall-clock budget rather
+    than the fixed attempt cap used for ordinary transient failures, so a long
+    server-dictated wait no longer drops the message on the final attempt.
+    """
+    if getattr(exc, "retry_after", None) is not None:
+        return True
+    text = str(exc).lower()
+    return "flood control" in text or "retry after" in text
+
+
+async def _send_telegram_message_with_retry(
+    bot,
+    *,
+    attempts: int = 3,
+    flood_budget_seconds: float | None = None,
+    **kwargs,
+):
+    """Send a Telegram message with bounded retries.
+
+    Ordinary transient failures (network flakes, 5xx) retry up to *attempts*
+    times using the backoff from :func:`_telegram_retry_delay`. Flood-control
+    (RetryAfter) failures instead keep honoring the server's ``retry_after``
+    (plus a little jitter, so concurrent senders don't re-collide in lockstep)
+    until ``flood_budget_seconds`` of wall-clock time is exhausted. This
+    replaces the old fixed 3-attempt cap that dropped the message when
+    ``retry_after`` (249s observed 2026-07-19) exceeded the third attempt.
+    """
+    if flood_budget_seconds is None:
+        flood_budget_seconds = _TELEGRAM_SEND_FLOOD_BUDGET_SECONDS
+    attempt = 0
+    flood_deadline = None
+    while True:
         try:
             return await bot.send_message(**kwargs)
         except Exception as exc:
             delay = _telegram_retry_delay(exc, attempt)
-            if delay is None or attempt >= attempts - 1:
+            if delay is None:
+                raise
+            if _is_telegram_flood_error(exc):
+                now = time.monotonic()
+                if flood_deadline is None:
+                    flood_deadline = now + flood_budget_seconds
+                delay += random.uniform(0.0, _TELEGRAM_SEND_FLOOD_JITTER_SECONDS)
+                if now + delay > flood_deadline:
+                    logger.error(
+                        "Telegram flood-control send budget %ds exhausted, "
+                        "giving up: %s",
+                        int(flood_budget_seconds),
+                        _sanitize_error_text(exc),
+                    )
+                    raise
+                logger.warning(
+                    "Telegram flood control on send (retrying in %.1fs, %.0fs of "
+                    "%ds budget left): %s",
+                    delay,
+                    max(flood_deadline - now, 0.0),
+                    int(flood_budget_seconds),
+                    _sanitize_error_text(exc),
+                )
+                await asyncio.sleep(delay)
+                # Flood waits are budget-bounded and must not consume the
+                # transient attempt cap.
+                continue
+            if attempt >= attempts - 1:
                 raise
             logger.warning(
                 "Transient Telegram send failure (attempt %d/%d), retrying in %.1fs: %s",
@@ -193,6 +280,7 @@ async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs)
                 _sanitize_error_text(exc),
             )
             await asyncio.sleep(delay)
+            attempt += 1
 
 
 SEND_MESSAGE_SCHEMA = {
@@ -1134,15 +1222,30 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             formatted = message
             send_parse_mode = ParseMode.HTML
         else:
-            # Reuse the gateway adapter's format_message for markdown→MarkdownV2
+            # Reuse the gateway adapter's format_message for markdown→MarkdownV2.
+            # format_message performs entity-aware escaping (escaping the
+            # MarkdownV2 reserved set — including '(' — outside code/link/entity
+            # spans), so its output is valid MarkdownV2 and the send below does
+            # not trip a parse error + plain-text re-send.
             try:
                 from plugins.platforms.telegram.adapter import TelegramAdapter
                 _adapter = TelegramAdapter.__new__(TelegramAdapter)
                 formatted = _adapter.format_message(message)
+                send_parse_mode = ParseMode.MARKDOWN_V2
             except Exception:
-                # Fallback: send as-is if formatting unavailable
+                # Formatting/escaping unavailable — send the RAW text as PLAIN
+                # text (no parse mode). Sending unescaped text under MarkdownV2
+                # would reliably fail on the first reserved char (e.g. '(') and
+                # force a second plain-text re-send, doubling per-chat volume
+                # into flood control (observed 2026-07-19: ~40 "character '('
+                # is reserved" fallbacks in one burst). Plain text can't parse-
+                # fail, so there is no doubled send.
+                logger.debug(
+                    "format_message unavailable in _send_telegram; "
+                    "sending raw text as plain (no MarkdownV2 parse)"
+                )
                 formatted = message
-            send_parse_mode = ParseMode.MARKDOWN_V2
+                send_parse_mode = None
 
         # Honour a configured proxy (telegram.proxy_url in config.yaml, exported
         # as TELEGRAM_PROXY env var by load_gateway_config). Without this, the
@@ -1261,7 +1364,14 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             parse_mode=send_parse_mode, **text_kwargs
                         )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
-                        logger.warning(
+                        # Last-resort single fallback: format_message already
+                        # entity-escapes MarkdownV2, so reaching here is rare
+                        # (e.g. HTML text Telegram rejects). Log at DEBUG, not
+                        # WARNING — this used to fire ~40x in one flood burst
+                        # (2026-07-19), and each WARNING masked the real cause
+                        # while the fallback re-send doubled per-chat volume.
+                        # The re-send happens once (no retry-counter recursion).
+                        logger.debug(
                             "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
                             send_parse_mode,
                             _sanitize_error_text(md_error),
