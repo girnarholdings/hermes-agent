@@ -1222,15 +1222,30 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             formatted = message
             send_parse_mode = ParseMode.HTML
         else:
-            # Reuse the gateway adapter's format_message for markdown→MarkdownV2
+            # Reuse the gateway adapter's format_message for markdown→MarkdownV2.
+            # format_message performs entity-aware escaping (escaping the
+            # MarkdownV2 reserved set — including '(' — outside code/link/entity
+            # spans), so its output is valid MarkdownV2 and the send below does
+            # not trip a parse error + plain-text re-send.
             try:
                 from plugins.platforms.telegram.adapter import TelegramAdapter
                 _adapter = TelegramAdapter.__new__(TelegramAdapter)
                 formatted = _adapter.format_message(message)
+                send_parse_mode = ParseMode.MARKDOWN_V2
             except Exception:
-                # Fallback: send as-is if formatting unavailable
+                # Formatting/escaping unavailable — send the RAW text as PLAIN
+                # text (no parse mode). Sending unescaped text under MarkdownV2
+                # would reliably fail on the first reserved char (e.g. '(') and
+                # force a second plain-text re-send, doubling per-chat volume
+                # into flood control (observed 2026-07-19: ~40 "character '('
+                # is reserved" fallbacks in one burst). Plain text can't parse-
+                # fail, so there is no doubled send.
+                logger.debug(
+                    "format_message unavailable in _send_telegram; "
+                    "sending raw text as plain (no MarkdownV2 parse)"
+                )
                 formatted = message
-            send_parse_mode = ParseMode.MARKDOWN_V2
+                send_parse_mode = None
 
         # Honour a configured proxy (telegram.proxy_url in config.yaml, exported
         # as TELEGRAM_PROXY env var by load_gateway_config). Without this, the
@@ -1349,7 +1364,14 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             parse_mode=send_parse_mode, **text_kwargs
                         )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
-                        logger.warning(
+                        # Last-resort single fallback: format_message already
+                        # entity-escapes MarkdownV2, so reaching here is rare
+                        # (e.g. HTML text Telegram rejects). Log at DEBUG, not
+                        # WARNING — this used to fire ~40x in one flood burst
+                        # (2026-07-19), and each WARNING masked the real cause
+                        # while the fallback re-send doubled per-chat volume.
+                        # The re-send happens once (no retry-counter recursion).
+                        logger.debug(
                             "Parse mode %s failed in _send_telegram, falling back to plain text: %s",
                             send_parse_mode,
                             _sanitize_error_text(md_error),
