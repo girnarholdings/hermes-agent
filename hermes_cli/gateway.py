@@ -38,6 +38,7 @@ from gateway.restart import (
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    GATEWAY_SIGTERM_EXIT_CODE,
     is_gateway_supervisor_process,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
@@ -3382,6 +3383,7 @@ Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
+SuccessExitStatus={GATEWAY_SIGTERM_EXIT_CODE}
 KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
@@ -3420,6 +3422,7 @@ Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
+SuccessExitStatus={GATEWAY_SIGTERM_EXIT_CODE}
 KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
