@@ -15,6 +15,14 @@ GATEWAY_SERVICE_RESTART_EXIT_CODE = 75
 # restarting the gateway.  See #51228.
 GATEWAY_FATAL_CONFIG_EXIT_CODE = 78
 
+# 128+SIGTERM — the shell convention for "terminated by SIGTERM".  Used for
+# unexpected (marker-less) SIGTERM shutdowns instead of a bare exit 1: the
+# generated systemd unit whitelists it via ``SuccessExitStatus`` so an
+# operator ``systemctl restart``/``stop`` no longer records "Failed with
+# result 'exit-code'", while the code stays non-zero so operator-managed
+# ``Restart=on-failure`` units still revive the gateway after external kills.
+GATEWAY_SIGTERM_EXIT_CODE = 143
+
 # Set by ``hermes gateway run --external-supervisor``. Unlike systemd's
 # INVOCATION_ID and launchd's XPC_SERVICE_NAME, this survives wrappers that
 # intentionally replace the child environment (for example ``sudo env -i``).

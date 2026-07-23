@@ -1966,6 +1966,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    GATEWAY_SIGTERM_EXIT_CODE,
     parse_restart_drain_timeout,
 )
 
@@ -23717,12 +23718,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     #   - WSL2/container runtime sending unexpected signals
     # `hermes gateway stop` and interactive Ctrl+C are handled above as
     # planned stops and should not trigger service-manager revival.
+    #
+    # The code is 143 (128+SIGTERM), not 1: the generated unit lists it in
+    # ``SuccessExitStatus`` so a marker-less operator ``systemctl restart``
+    # doesn't record "Failed with result 'exit-code'" on every restart,
+    # while operator-managed ``Restart=on-failure`` units (no whitelist)
+    # still see a non-zero exit and revive the gateway.
     if _signal_initiated_shutdown and not runner._restart_requested:
         logger.info(
-            "Exiting with code 1 (signal-initiated shutdown without restart "
-            "request) so systemd Restart=on-failure can revive the gateway."
+            "Exiting with code %d (signal-initiated shutdown without restart "
+            "request) so service managers can distinguish a SIGTERM stop "
+            "from a crash.", GATEWAY_SIGTERM_EXIT_CODE,
         )
-        return False  # → sys.exit(1) in the caller
+        raise SystemExit(GATEWAY_SIGTERM_EXIT_CODE)
 
     # Older restart paths may reach here without ``runner.exit_code`` set.
     # Keep the historical non-zero fallback for service-managed restarts.

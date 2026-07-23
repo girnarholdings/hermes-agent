@@ -13,7 +13,7 @@ from pathlib import Path
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
 
-    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     return executions
 
 
@@ -67,12 +67,13 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
-    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
-    executions.EXECUTIONS_FILE.write_bytes(b"not a sqlite database")
+    ledger = executions.get_executions_file()
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_bytes(b"not a sqlite database")
 
     with __import__("pytest").raises(sqlite3.DatabaseError):
         executions.create_execution("new", source="builtin")
-    assert executions.EXECUTIONS_FILE.read_bytes() == b"not a sqlite database"
+    assert ledger.read_bytes() == b"not a sqlite database"
 
 
 def test_execution_history_is_paginated(monkeypatch, tmp_path):
@@ -133,7 +134,7 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
 def test_recovery_does_not_mark_other_live_owner_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("other-live", source="builtin")
-    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+    with sqlite3.connect(executions.get_executions_file()) as conn:
         conn.execute(
             "UPDATE executions SET process_id=?, pid=? WHERE id=?",
             ("another-import", os.getpid(), record["id"]),
@@ -146,7 +147,7 @@ def test_recovery_does_not_mark_other_live_owner_unknown(monkeypatch, tmp_path):
 def test_recovery_rejects_recycled_pid(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("recycled", source="builtin")
-    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+    with sqlite3.connect(executions.get_executions_file()) as conn:
         conn.execute(
             "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
             ("old-import", -1, record["id"]),
@@ -319,3 +320,31 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+def test_ledger_path_follows_hermes_home_at_call_time(monkeypatch, tmp_path):
+    """Test fixture rows must land in the per-test tempdir, never the real home.
+
+    Regression: the ledger path used to be resolved once at module import,
+    BEFORE pytest's hermetic fixture monkeypatched HERMES_HOME, so any suite
+    that exercised the scheduler wrote its fixture rows (j1..j10, monitor-job,
+    tg-job, ...) into the developer's production ``~/.hermes/cron/executions.db``.
+    """
+    import cron.executions as executions  # imported long before this test runs
+
+    stale_home = tmp_path / "stale-home"
+    fresh_home = tmp_path / "fresh-home"
+    monkeypatch.setenv("HERMES_HOME", str(stale_home))
+    monkeypatch.setenv("HERMES_HOME", str(fresh_home))
+
+    record = executions.create_execution("isolation-probe", source="builtin")
+
+    assert not (stale_home / "cron" / "executions.db").exists()
+    ledger = fresh_home.resolve() / "cron" / "executions.db"
+    assert executions.get_executions_file() == ledger
+    assert ledger.exists()
+    with sqlite3.connect(ledger) as conn:
+        rows = conn.execute(
+            "SELECT job_id FROM executions WHERE id=?", (record["id"],)
+        ).fetchall()
+    assert [row[0] for row in rows] == ["isolation-probe"]
