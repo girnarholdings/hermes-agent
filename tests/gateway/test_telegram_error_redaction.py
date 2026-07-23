@@ -16,6 +16,8 @@ the raw exception:
   lower blast radius, but the same unredacted-exception pattern.
 """
 
+import ast
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -188,3 +190,53 @@ async def test_delete_message_failure_redacts_token_in_log(caplog):
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert _SECRET_TOKEN not in logged
     assert "***" in logged
+
+
+def _adapter_module_ast() -> ast.Module:
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    return ast.parse(inspect.getsource(adapter_module))
+
+
+def test_redactor_name_never_appears_inside_string_literals():
+    """The redactor must be *called*, never pasted into a log format string.
+
+    Regression: a mechanical edit rewrote two log lines to
+    ``"... _redact_telegram_error_text(error) ...: %s"`` — the helper's call
+    text landed inside the message while the raw exception (bot token URL
+    included) was still what got logged.
+    """
+    offenders = [
+        node.value
+        for node in ast.walk(_adapter_module_ast())
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "_redact_telegram_error_text" in node.value
+    ]
+    assert offenders == []
+
+
+def test_polling_error_callback_never_logs_the_raw_error():
+    """Every logger arg in ``_polling_error_callback`` that forwards the
+    caught exception must be wrapped in ``_redact_telegram_error_text``."""
+    callbacks = [
+        node
+        for node in ast.walk(_adapter_module_ast())
+        if isinstance(node, ast.FunctionDef) and node.name == "_polling_error_callback"
+    ]
+    assert callbacks, "polling error callback not found — did it get renamed?"
+
+    bare_error_args = []
+    for callback in callbacks:
+        for node in ast.walk(callback):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"
+            ):
+                continue
+            for arg in node.args:
+                if isinstance(arg, ast.Name) and arg.id == "error":
+                    bare_error_args.append(ast.dump(node.func))
+    assert bare_error_args == []
