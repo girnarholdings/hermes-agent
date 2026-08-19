@@ -161,3 +161,57 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_resolve_worker_cli_toolsets_re_enables_policy_blocked_mutation_tools(monkeypatch, tmp_path):
+    """The interactive least-privilege policy (nima-infra
+    apply_profile_toolset_policy) appends the mutation toolsets to a domain
+    profile's agent.disabled_toolsets, which would cripple a dispatcher-spawned
+    kanban worker (no bash/file/kanban). The worker spawn must re-enable the
+    mutation toolsets so an assigned task can actually be worked; the Telegram
+    gateway allowlist still keeps the interactive surface read-only."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "infra-ops"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("toolsets:\n  - hermes-cli\n", encoding="utf-8")
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  telegram:
+    - web
+    - skills
+    - memory
+    - todo
+    - clarify
+    - no_mcp
+toolsets:
+  - web
+  - terminal
+  - file
+  - skills
+  - memory
+  - todo
+  - clarify
+agent:
+  disabled_toolsets:
+    - browser
+    - terminal
+    - file
+    - code_execution
+    - delegation
+    - cronjob
+    - kanban
+    - session_search
+    - vision
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved is not None
+    for required in ("terminal", "file", "code_execution", "kanban"):
+        assert required in resolved
