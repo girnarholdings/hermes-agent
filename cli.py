@@ -5263,9 +5263,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
-        from agent.skill_utils import parse_config_string_list
-
         self.disabled_toolsets = parse_config_string_list(CLI_CONFIG["agent"].get("disabled_toolsets"))
+
+        # Dispatcher-spawned kanban workers are sanctioned mutation contexts:
+        # the dispatcher scopes the worker to its task workspace / branch /
+        # run claim, and the board protocol requires kanban_* + file +
+        # terminal to do work. The interactive least-privilege policy blocks
+        # these toolsets globally for domain profiles; exempt them for the
+        # worker session only (HERMES_KANBAN_TASK is set by the spawn). The
+        # Telegram gateway allowlist still keeps the interactive surface
+        # read-only.
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            _worker_mutation_toolsets = {
+                "terminal", "file", "code_execution", "delegation",
+                "cronjob", "kanban", "session_search",
+            }
+            self.disabled_toolsets = [
+                t for t in self.disabled_toolsets
+                if t not in _worker_mutation_toolsets
+            ]
 
         if toolsets and "all" not in toolsets and "*" not in toolsets:
             # Validate each toolset — MCP server names are resolved via

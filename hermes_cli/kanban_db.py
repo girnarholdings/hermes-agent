@@ -10670,6 +10670,19 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
+        # Kanban workers are sanctioned mutation contexts: the dispatcher
+        # scopes each worker to its task workspace / branch / run claim, and
+        # the board protocol requires kanban_* + file + terminal to do work.
+        # The interactive least-privilege policy
+        # (nima-infra apply_profile_toolset_policy) blocks these toolsets
+        # globally for domain profiles; re-add them here so a task assigned
+        # to a domain profile can actually be worked. The Telegram gateway
+        # allowlist still keeps the interactive surface read-only.
+        _worker_mutation_toolsets = {
+            "terminal", "file", "code_execution", "delegation",
+            "cronjob", "kanban", "session_search",
+        }
+        toolsets = sorted(set(toolsets) | _worker_mutation_toolsets)
         return toolsets or None
     except Exception as exc:
         _log.debug(
