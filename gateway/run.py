@@ -30501,6 +30501,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                # Pass per-profile adapter maps so profile cron jobs deliver
+                # through their OWN bot identity, not the default profile's.
+                # Without this, every profile briefing lands in the root channel
+                # from the root bot — polluting the working DM (#cron-profile-delivery).
+                cron_start_kwargs["profile_adapters"] = getattr(
+                    runner, "_profile_adapters", {}
+                )
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),
