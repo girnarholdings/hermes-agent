@@ -5263,6 +5263,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
+        from agent.skill_utils import parse_config_string_list
+
         self.disabled_toolsets = parse_config_string_list(CLI_CONFIG["agent"].get("disabled_toolsets"))
 
         # Dispatcher-spawned kanban workers are sanctioned mutation contexts:
