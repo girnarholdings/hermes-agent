@@ -640,3 +640,88 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+
+def test_multiplex_ticker_passes_profile_specific_adapters(tmp_path, monkeypatch):
+    """Profile cron jobs must deliver through their OWN bot, never the root.
+
+    Regression guard for the 2026-08-19 incident: the upstream catchup rebase
+    (merge PR #14) dropped the fork's profile-adapter routing fix (PR #13,
+    commit 27d7e15feb), and every profile briefing silently delivered through
+    the root bot to the root DM for a day. This test pins the three seams:
+
+      1. start() accepts profile_adapters and forwards them to _start_multiplex
+      2. _start_multiplex selects the per-profile adapter dict
+      3. a profile WITHOUT its own adapter falls back to root adapters
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+    import inspect
+
+    # Seam 1: the start() signature carries profile_adapters.
+    start_sig = inspect.signature(InProcessCronScheduler.start)
+    assert "profile_adapters" in start_sig.parameters, (
+        "start() lost profile_adapters — profile cron delivery regressed to "
+        "the root bot (2026-08-19 incident)")
+
+    # Seam 2: _start_multiplex carries it too, and the tick call site selects
+    # per-profile adapters with a root fallback for adapter-less profiles.
+    mux_sig = inspect.signature(InProcessCronScheduler._start_multiplex)
+    assert "profile_adapters" in mux_sig.parameters, (
+        "_start_multiplex lost profile_adapters — profile cron delivery "
+        "regressed to the root bot")
+
+    source = inspect.getsource(InProcessCronScheduler._start_multiplex)
+    assert "prof_adapters" in source, (
+        "_start_multiplex no longer selects per-profile adapters — profile "
+        "cron delivery regressed to the root bot")
+    assert "prof_adapters or adapters" in source, (
+        "_start_multiplex lost the root fallback for adapter-less profiles")
+
+    # Behavioral: with profile_adapters provided, each profile's tick receives
+    # that profile's adapter dict (not the root dict).
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "home-ops"
+    for d in (p1, p2):
+        (d / "cron").mkdir(parents=True)
+    profile_homes = [("default", p1), ("home-ops", p2)]
+    root_adapters = {"telegram": "ROOT"}
+    prof_adapters = {
+        "default": {"telegram": "DEFAULT"},
+        "home-ops": {"telegram": "HOME_OPS"},
+    }
+
+    seen: list[dict] = []
+
+    def _capturing_tick(*args, **kwargs):
+        seen.append(dict(kwargs))
+        return 0
+
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+
+    with patch("cron.scheduler.tick", side_effect=_capturing_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        t = threading.Thread(
+            target=prov.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "adapters": root_adapters,
+                "profile_adapters": prof_adapters,
+            },
+            daemon=True,
+        )
+        t.start()
+        deadline = time.monotonic() + 10
+        while len(seen) < len(profile_homes) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+    assert len(seen) >= len(profile_homes), f"expected tick calls, got {len(seen)}"
+    for call in seen:
+        assert call.get("adapters") in ({"telegram": "DEFAULT"},
+                                        {"telegram": "HOME_OPS"}), (
+            f"tick got root adapters {call.get('adapters')} — profile routing "
+            "is broken")
