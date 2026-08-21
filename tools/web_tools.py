@@ -342,6 +342,84 @@ def _get_extract_backend() -> str:
     return _get_capability_backend("extract")
 
 
+def _search_failover(
+    query: str,
+    limit: int,
+    *,
+    first_provider: Any,
+    original_error: Optional[str],
+) -> Dict[str, Any]:
+    """Try every other available search provider after the active one fails.
+
+    The registry's explicit-config resolution returns the configured backend
+    even when it is *unavailable* (so the user gets a precise credential error
+    instead of a silent switch).  But a configured backend can also be
+    available-yet-failing at call time — the canonical case is a local
+    SearXNG instance whose process is down while ``SEARXNG_URL`` still points
+    at it.  In that situation the right behavior is failover: walk the
+    remaining registered providers in preference order and return the first
+    successful result set.
+
+    Only ``success: False`` responses from the primary trigger a walk; a valid
+    empty result set is a real answer.  The returned payload is either the
+    first successful provider's results (labelled with ``failed_over_from``
+    for transparency) or the original error enriched with the list of
+    providers that were attempted, so callers can tell a hard outage from a
+    single-backend blip.
+    """
+    from agent.web_search_registry import list_providers
+
+    if not original_error:
+        original_error = "search failed"
+    tried = [getattr(first_provider, "name", "primary")]
+    attempted: List[str] = []
+    for candidate in list_providers():
+        name = getattr(candidate, "name", "")
+        if name in tried or name in attempted:
+            continue
+        if name == getattr(first_provider, "name", None):
+            continue
+        if not candidate.supports_search():
+            continue
+        try:
+            if not candidate.is_available():
+                continue
+        except Exception:  # noqa: BLE001 — availability probe must not kill failover
+            continue
+        attempted.append(name)
+        logger.info(
+            "Web search failover: %s failed (%s); trying %s",
+            tried[0], original_error, name,
+        )
+        try:
+            response = candidate.search(query, limit)
+        except Exception as exc:  # noqa: BLE001 — a throwing provider must not kill failover
+            logger.warning("Web search failover %s raised: %s", name, exc)
+            continue
+        if response and response.get("success"):
+            response["failed_over_from"] = tried[0]
+            logger.info(
+                "Web search failover succeeded via %s after %s failed",
+                name, tried[0],
+            )
+            return response
+        if response and response.get("error"):
+            logger.warning(
+                "Web search failover %s also failed: %s", name, response.get("error"),
+            )
+    logger.warning(
+        "Web search failover exhausted: %s attempted after %s (%s)",
+        attempted or "no other provider", tried[0], original_error,
+    )
+    return {
+        "success": False,
+        "error": (
+            f"{original_error} (failed over: "
+            f"{', '.join(attempted) if attempted else 'no available fallback'})"
+        ),
+    }
+
+
 def _get_capability_backend(capability: str) -> str:
     """Shared helper for per-capability backend selection.
 
@@ -975,6 +1053,16 @@ def web_search_tool(query: str, limit: int = 5) -> str:
                 else:
                     raise
             else:
+                # Failover: if the active provider errored (e.g. local SearXNG
+                # is down), walk the remaining available providers in legacy
+                # preference order and return the first that succeeds. Only
+                # ``success: False`` responses trigger this — a valid empty
+                # result set is a real answer, not a failure to fail over from.
+                if not response_data.get("success"):
+                    response_data = _search_failover(
+                        query, limit, first_provider=provider,
+                        original_error=response_data.get("error"),
+                    )
                 if (
                     not response_data.get("success")
                     and _rescue_eligible(provider)
