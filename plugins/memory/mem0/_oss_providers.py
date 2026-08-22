@@ -13,6 +13,18 @@ LLM_PROVIDERS: dict[str, dict[str, Any]] = {
         "default_model": "gpt-5-mini",
         "base_url_key": "openai_base_url",
     },
+    # Native DeepSeek provider (mem0.llms.deepseek.DeepSeekLLM). Prefer this
+    # over provider "openai" + openai_base_url=api.deepseek.com: the OpenAI
+    # LLM class silently reroutes to OpenRouter whenever OPENROUTER_API_KEY
+    # is present in the environment, which breaks extraction for accounts
+    # whose OpenRouter allowed-providers exclude DeepSeek.
+    "deepseek": {
+        "label": "DeepSeek",
+        "needs_key": True,
+        "env_var": "DEEPSEEK_API_KEY",
+        "default_model": "deepseek-chat",
+        "base_url_key": "deepseek_base_url",
+    },
     "ollama": {
         "label": "Ollama (local)",
         "needs_key": False,

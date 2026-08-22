@@ -311,5 +311,16 @@ class OSSBackend(Mem0Backend):
             client = getattr(vs, "client", None)
             if client and hasattr(client, "close"):
                 client.close()
+            # Memory.from_config also opens a telemetry/migrations vector
+            # store (e.g. <MEM0_DIR>/migrations_qdrant for file-based
+            # providers). Left open, it keeps the local-Qdrant path lock and
+            # any later Memory() on the same paths fails with "Storage
+            # folder ... already accessed by another instance".
+            tvs = getattr(self._memory, "_telemetry_vector_store", None)
+            if tvs and hasattr(tvs, "close"):
+                tvs.close()
+            tclient = getattr(tvs, "client", None)
+            if tclient and hasattr(tclient, "close"):
+                tclient.close()
         except Exception:
             pass
