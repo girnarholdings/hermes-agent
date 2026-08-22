@@ -339,6 +339,43 @@ class TestDoctorMemoryProviderSection:
         assert "Memory Provider" in out
         assert "Built-in memory active" not in out
 
+    def test_mem0_oss_mode_is_ok_without_platform_api_key(self, monkeypatch, tmp_path):
+        """OSS (self-hosted) mem0 needs no MEM0_API_KEY — doctor must not flag it."""
+        fake_mem0 = types.SimpleNamespace(
+            _load_config=lambda: {
+                "mode": "oss",
+                "user_id": "u1",
+                "agent_id": "a1",
+                "api_key": "",
+                "oss": {
+                    "llm": {"provider": "deepseek"},
+                    "vector_store": {"provider": "qdrant"},
+                },
+            }
+        )
+        monkeypatch.setitem(sys.modules, "plugins.memory.mem0", fake_mem0)
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
+        assert "Mem0 OSS mode configured" in out
+        assert "llm=deepseek vector_store=qdrant" in out
+        assert "Mem0 API key not set" not in out
+        # No issue should be raised for a healthy OSS install
+        assert "Mem0 is set as memory provider but API key is missing" not in out
+
+    def test_mem0_platform_mode_still_requires_api_key(self, monkeypatch, tmp_path):
+        """Platform mode without MEM0_API_KEY must keep failing loudly."""
+        fake_mem0 = types.SimpleNamespace(
+            _load_config=lambda: {
+                "mode": "platform",
+                "user_id": "u1",
+                "agent_id": "a1",
+                "api_key": "",
+            }
+        )
+        monkeypatch.setitem(sys.modules, "plugins.memory.mem0", fake_mem0)
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
+        assert "Mem0 API key not set" in out
+        assert "Mem0 is set as memory provider but API key is missing" in out
+
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()

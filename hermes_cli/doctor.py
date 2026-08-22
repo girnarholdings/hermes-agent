@@ -3037,7 +3037,20 @@ def run_doctor(args):
             from plugins.memory.mem0 import _load_config as _load_mem0_config
             mem0_cfg = _load_mem0_config()
             mem0_key = mem0_cfg.get("api_key", "")
-            if mem0_key:
+            if mem0_cfg.get("mode") == "oss":
+                # OSS (self-hosted) mode uses no platform API key — the llm /
+                # embedder / vector_store config under cfg["oss"] carries its
+                # own credentials. Demanding MEM0_API_KEY here is a false
+                # positive that turns every healthy OSS install "red".
+                oss_cfg = mem0_cfg.get("oss") or {}
+                oss_llm = (oss_cfg.get("llm") or {}).get("provider", "")
+                oss_vs = (oss_cfg.get("vector_store") or {}).get("provider", "")
+                check_ok(
+                    "Mem0 OSS mode configured",
+                    f"llm={oss_llm or '?'} vector_store={oss_vs or '?'} (platform API key not required)",
+                )
+                check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
+            elif mem0_key:
                 check_ok("Mem0 API key configured")
                 check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
             else:
