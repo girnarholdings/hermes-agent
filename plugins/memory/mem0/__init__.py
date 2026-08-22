@@ -364,6 +364,19 @@ class Mem0MemoryProvider(MemoryProvider):
             _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
         )
         self._channel = kwargs.get("platform") or "cli"
+        # Re-init across sessions must not leak the previous backend's Qdrant
+        # client: local Qdrant storage permits exactly one live client per
+        # path, so a second Memory.from_config() on the same path raises
+        # "Storage folder ... is already accessed by another instance".
+        # Close the old backend BEFORE constructing the new one — constructing
+        # first can never succeed while the old client still holds the path.
+        old_backend = self._backend
+        self._backend = None
+        if old_backend is not None:
+            try:
+                old_backend.close()
+            except Exception:
+                pass
         self._backend = self._create_backend()
         if self._backend and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
