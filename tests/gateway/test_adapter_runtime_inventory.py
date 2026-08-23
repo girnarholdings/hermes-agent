@@ -119,6 +119,9 @@ async def test_auth_failure_records_class_only_and_never_exception_text(
             self.disconnected = False
             self._observer = None
 
+        def set_platform_event_handler(self, _handler):
+            pass  # upstream base-adapter seam (platform event routing); no-op for inventory tests
+
         def set_adapter_runtime_observer(self, observer):
             self._observer = observer
 
@@ -157,7 +160,7 @@ async def test_auth_failure_records_class_only_and_never_exception_text(
         )
     }
 
-    async def _fail_connect(_adapter, _platform):
+    async def _fail_connect(_adapter, _platform, *, is_reconnect=False, initial=False):
         raise InvalidCredential(exception_text_canary)
 
     monkeypatch.setattr("gateway.config.load_gateway_config", lambda: profile_cfg)
@@ -276,6 +279,9 @@ async def test_duplicate_credential_remains_fail_closed_and_inventory_is_redacte
             self.token = credential_canary
             self.disconnected = False
 
+        def set_platform_event_handler(self, _handler):
+            pass  # upstream base-adapter seam; no-op for inventory tests
+
         async def disconnect(self):
             self.disconnected = True
 
@@ -302,7 +308,11 @@ async def test_duplicate_credential_remains_fail_closed_and_inventory_is_redacte
     record = _record("worker", "telegram")
 
     assert connected == 0
-    assert duplicate.disconnected is True
+    # Upstream catch-up 2026-08-23: a never-connected duplicate adapter is NOT
+    # disconnected — disconnect() can mutate shared platform state and, for a
+    # same-credential Photon adapter, shut down the primary's live sidecar.
+    # The duplicate is refused via inventory + runtime status instead.
+    assert duplicate.disconnected is False
     assert record["last_error_class"] == DuplicateCredentialError.__name__
     assert credential_canary.encode() not in raw
     assert fingerprint.encode() not in raw
