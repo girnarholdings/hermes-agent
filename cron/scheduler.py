@@ -7464,18 +7464,18 @@ def _run_one_job_body(
         _deferred_agents: list = []
         _delivery_evidence: list = []
         try:
-            run_kwargs = {
-                "defer_agent_teardown": _deferred_agents,
-                "extra_prompt": extra_prompt,
-            }
-            if fire_claim_lost is not None:
-                run_kwargs["cancel_event"] = fire_claim_lost
+            run_kwargs = {"defer_agent_teardown": _deferred_agents}
             # Compatibility for embedders/tests that monkeypatch the historical
-            # two-argument function: only pass the optional narrow-waist holder
-            # when the callable advertises it.
+            # two-argument function: only pass the optional narrow-waist
+            # parameters when the callable advertises them.
             import inspect
 
-            if "delivery_evidence_out" in inspect.signature(run_job).parameters:
+            _run_job_params = inspect.signature(run_job).parameters
+            if "extra_prompt" in _run_job_params:
+                run_kwargs["extra_prompt"] = extra_prompt
+            if fire_claim_lost is not None and "cancel_event" in _run_job_params:
+                run_kwargs["cancel_event"] = fire_claim_lost
+            if "delivery_evidence_out" in _run_job_params:
                 run_kwargs["delivery_evidence_out"] = _delivery_evidence
             success, output, final_response, error = run_job(job, **run_kwargs)
         except BaseException:

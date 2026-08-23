@@ -498,8 +498,8 @@ def test_run_one_passes_evidence_to_delivery(monkeypatch):
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/out")
     monkeypatch.setattr(scheduler, "_deliver_result", deliver)
     monkeypatch.setattr(scheduler, "_record_job_outcome", lambda *args, **kwargs: None)
-    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
-    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id, _token=None: False)
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id, _token=None: False)
 
     assert scheduler.run_one_job(_job()) is True
     assert captured["evidence"] == _evidence()
@@ -518,7 +518,7 @@ def test_failed_agent_alert_cannot_consume_producer_receipt(monkeypatch):
         captured["evidence"] = delivery_evidence
         return None
 
-    def record(job, success, error, delivery_error=None, *, retry_allowed=True):
+    def record(job, success, error, delivery_error=None, *, retry_allowed=True, **_mark_kwargs):
         recorded.update(success=success, error=error, retry_allowed=retry_allowed)
 
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
@@ -526,8 +526,8 @@ def test_failed_agent_alert_cannot_consume_producer_receipt(monkeypatch):
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/out")
     monkeypatch.setattr(scheduler, "_deliver_result", deliver)
     monkeypatch.setattr(scheduler, "_record_job_outcome", record)
-    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
-    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id, _token=None: False)
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id, _token=None: False)
 
     assert scheduler.run_one_job(_job()) is True
     assert "model failed" in captured["content"]
@@ -549,7 +549,7 @@ def test_unknown_delivery_marks_failure_and_blocks_automatic_retry(monkeypatch):
     def deliver(*args, **kwargs):
         raise DeliveryReceiptUnknown("ambiguous transport")
 
-    def record(job, success, error, delivery_error=None, *, retry_allowed=True):
+    def record(job, success, error, delivery_error=None, *, retry_allowed=True, **_mark_kwargs):
         recorded.update(
             success=success,
             error=error,
@@ -562,8 +562,8 @@ def test_unknown_delivery_marks_failure_and_blocks_automatic_retry(monkeypatch):
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/out")
     monkeypatch.setattr(scheduler, "_deliver_result", deliver)
     monkeypatch.setattr(scheduler, "_record_job_outcome", record)
-    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
-    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id, _token=None: False)
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id, _token=None: False)
 
     assert scheduler.run_one_job(_job()) is True
     assert recorded == {
@@ -584,7 +584,7 @@ def test_confirmed_no_send_marks_failure_and_allows_retry(monkeypatch):
     def deliver(*args, **kwargs):
         raise DeliveryReceiptRetryable("confirmed not sent")
 
-    def record(job, success, error, delivery_error=None, *, retry_allowed=True):
+    def record(job, success, error, delivery_error=None, *, retry_allowed=True, **_mark_kwargs):
         recorded.update(success=success, retry_allowed=retry_allowed)
 
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
@@ -592,8 +592,8 @@ def test_confirmed_no_send_marks_failure_and_allows_retry(monkeypatch):
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/out")
     monkeypatch.setattr(scheduler, "_deliver_result", deliver)
     monkeypatch.setattr(scheduler, "_record_job_outcome", record)
-    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
-    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id, _token=None: False)
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id, _token=None: False)
 
     assert scheduler.run_one_job(_job()) is True
     assert recorded == {"success": False, "retry_allowed": True}
