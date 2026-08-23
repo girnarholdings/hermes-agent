@@ -4580,6 +4580,15 @@ def _run_job_script(
             try:
                 for line in iter(stream.readline, ""):
                     events.put((label, line))
+            except UnicodeDecodeError as decode_err:
+                # Truncated/invalid UTF-8 in script output (#47393): a raised
+                # UnicodeDecodeError here would kill the reader thread before
+                # its sentinel, wedging the capture loop and silently dropping
+                # everything already buffered. Degrade the bad line to a
+                # replacement marker instead — the run may fail, but it fails
+                # as a (False, message) result the scheduler can deliver, and
+                # never as a silent empty capture.
+                events.put((label, f"\ufffd[undecodable script output: {decode_err}]\n"))
             finally:
                 events.put((label, None))
                 stream.close()
@@ -7230,7 +7239,7 @@ def _record_job_outcome(
     *,
     retry_allowed: bool = True,
     extra_mark_kwargs: Optional[dict] = None,
-) -> Optional[bool]:
+) -> bool:
     """Record a job's run outcome, re-arming a retry on failure when configured.
 
     Wraps ``mark_job_run`` with optional retry-on-failure. Always records the
@@ -7248,6 +7257,12 @@ def _record_job_outcome(
     The interrupted-flag consume is intentionally the caller's responsibility
     (stays *outside* this helper) so a manually-interrupted run is never
     silently retried.
+
+    Returns ``mark_job_run``'s bool verbatim (True = recorded; False = owner
+    fence rejected the write — e.g. the fire claim was taken over), never
+    ``None``: upstream's ``not marked`` owner-fence check treats a falsy
+    return as "claim lost", so swallowing the bool here would mislabel a
+    successful no-retry run as ``Fire claim ownership lost``.
     """
     # Always record the honest outcome + recompute the cron next_run_at.
     mark_kwargs = {"delivery_error": delivery_error}
@@ -7265,7 +7280,7 @@ def _record_job_outcome(
 
     retry_cfg = job.get("retry")
     if not retry_cfg:
-        return  # no retry configured — current behavior preserved exactly
+        return marked  # no retry configured — current behavior preserved exactly
 
     max_attempts = retry_cfg.get("max_attempts", 0)
     delay_seconds = retry_cfg.get("delay_seconds", 300)

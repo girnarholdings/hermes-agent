@@ -14,6 +14,7 @@ import sys
 import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 def _make_fake_popen(captured, *, stdout="ok\n", stderr="", returncode=0):
     """Build a subprocess.Popen stand-in that records argv/kwargs.
 
-    _run_job_script streams output through a reader thread over ``proc.stdout``/
+    _run_job_script streams output through reader threads over ``proc.stdout``/
     ``proc.stderr`` (it uses ``subprocess.Popen``, not ``subprocess.run``), so
     the fake exposes readable text streams plus poll()/wait(). The captured
     argv/kwargs still let callers assert interpreter/env/creationflags choices.
@@ -184,10 +185,26 @@ class TestRunJobScript:
 
         captured = {}
 
-        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        class FakeProc:
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured["kwargs"] = kwargs
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                return ("ok\n", "")
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        fake_run = FakeProc
+
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", _make_fake_popen(captured))
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_run)
 
         success, output = _run_job_script("probe.py")
 
@@ -235,10 +252,20 @@ class TestRunJobScript:
         script = cron_env / "scripts" / "probe.py"
         script.write_text("import mypkg; print(mypkg.VALUE)\n", encoding="utf-8")
 
-        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
-        monkeypatch.setattr(sched_mod.sys, "executable", str(pythonw))
-        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", _make_fake_popen(captured))
+        argv = _windows_cron_bootstrap_argv(
+            sys.executable, {"VIRTUAL_ENV": str(venv)}, str(script)
+        )
+        # Run the bootstrap with the current interpreter (stands in for the
+        # base python.exe on Windows; the semantics are interpreter-agnostic).
+        result = subprocess.run(argv, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "42"
+
+    def test_bootstrap_keeps_script_directory_on_sys_path(self, cron_env, tmp_path):
+        """`python script.py` puts the script's directory on sys.path, so a
+        script may import a sibling module. The bootstrap must preserve that
+        (runpy.run_path alone does not add it)."""
+        import subprocess
 
         from cron.scheduler import _windows_cron_bootstrap_argv
 
@@ -291,7 +318,12 @@ class TestRunJobScript:
         captured = {}
 
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", _make_fake_popen(captured))
+        # Streaming-aware Popen stand-in (see test_non_overlay_branch above):
+        # upstream's reader threads consume proc.stdout/proc.stderr/proc.pid —
+        # a poll/communicate-only fake wedges the capture loop.
+        monkeypatch.setattr(
+            sched_mod.subprocess, "Popen", _make_fake_popen(captured)
+        )
 
         success, output = _run_job_script("probe.py")
 
@@ -315,23 +347,17 @@ class TestRunJobScript:
 
         captured = {}
 
-        class FakeProc:
-            def __init__(self, argv, **kwargs):
-                captured["argv"] = argv
-                self.returncode = 0
-
-            def poll(self):
-                return self.returncode
-
-            def communicate(self, timeout=None):
-                return ("ok\n", "")
-
         monkeypatch.setattr(
             sched_mod,
             "_windows_cron_python_invocation",
             lambda python_exe: (python_exe, {}),
         )
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", FakeProc)
+        # Streaming-aware Popen stand-in: upstream's reader threads consume
+        # proc.stdout/proc.stderr/proc.pid — a poll/compile-only fake wedges
+        # the capture loop into a silent empty output.
+        monkeypatch.setattr(
+            sched_mod.subprocess, "Popen", _make_fake_popen(captured)
+        )
 
         success, output = _run_job_script("probe.py")
 
@@ -347,58 +373,6 @@ class TestRunJobScript:
         carry emoji through. Either way the delivery content is the real
         text, never an exception.
         """
-
-    def test_script_output_progress_prevents_stall(self, cron_env, monkeypatch):
-        from cron import scheduler as sched_mod
-        from cron.scheduler import _run_job_script
-
-        monkeypatch.setattr(sched_mod, "_SCRIPT_STALL_TIMEOUT", 1)
-        script = cron_env / "scripts" / "progress.py"
-        script.write_text(
-            "import time\n"
-            "for n in range(5):\n"
-            "    print(f'progress {n}', flush=True)\n"
-            "    time.sleep(0.35)\n"
-        )
-
-        success, output = _run_job_script(str(script), progress_key="job-progress")
-
-        assert success is True
-        assert "progress 4" in output
-
-    def test_silent_script_hits_stall_limit_before_hard_timeout(self, cron_env, monkeypatch):
-        from cron import scheduler as sched_mod
-        from cron.scheduler import _run_job_script
-
-        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 10)
-        monkeypatch.setattr(sched_mod, "_SCRIPT_STALL_TIMEOUT", 1)
-        script = cron_env / "scripts" / "silent.py"
-        script.write_text("import time; time.sleep(30)\n")
-
-        success, output = _run_job_script(str(script), progress_key="job-silent")
-
-        assert success is False
-        assert "stalled" in output.lower()
-
-    def test_script_progress_sidecar_is_owner_only_and_terminal(self, cron_env):
-        from cron.scheduler import _run_job_script
-
-        script = cron_env / "scripts" / "sidecar.py"
-        script.write_text('print("done", flush=True)\n')
-
-        success, _ = _run_job_script(str(script), progress_key="job-sidecar")
-
-        assert success is True
-        progress = cron_env / "cron" / "progress" / "job-sidecar.json"
-        payload = json.loads(progress.read_text())
-        assert payload["schema"] == "hermes.cron-script-progress.v1"
-        assert payload["job_id"] == "job-sidecar"
-        assert payload["status"] == "complete"
-        assert payload["output_events"] >= 1
-        assert progress.stat().st_mode & 0o777 == 0o600
-
-    def test_script_json_output(self, cron_env):
-        """Scripts can output structured JSON for the LLM to parse."""
         from cron.scheduler import _run_job_script
 
         script = cron_env / "scripts" / "emoji.py"

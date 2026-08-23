@@ -221,7 +221,11 @@ def recover_interrupted_executions() -> int:
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
-    with _lock, _connect() as conn:
+    # _transaction() (not a bare _connect()) so the connection is closed on
+    # every path — both upstream and the fork parent close here; a raw
+    # _connect() leaks the handle + WAL/SHM fds on every recovery sweep
+    # (#69567 regression caught by test_ledger_operations_close_every_connection).
+    with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, process_id, pid, process_started_at FROM executions
                WHERE status IN ('claimed','running')"""

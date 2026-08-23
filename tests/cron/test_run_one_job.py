@@ -314,7 +314,16 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
         s.run_one_job({"id": "j6", "name": "interrupt", "deliver": "telegram"})
 
     assert delivered == []
-    assert marked == [(("j6", False, "KeyboardInterrupt"), {})]
+    # No fire claim in this scenario -> no expected_fire_owner kwarg; and
+    # KeyboardInterrupt is not an Exception subclass, so no delivery_error is
+    # recorded either (no delivery was attempted). The resolved upstream seam
+    # records via _record_job_outcome -> mark_job_run(job_id, False, err).
+    assert marked == [
+        (
+            ("j6", False, "KeyboardInterrupt"),
+            {"delivery_error": None},
+        )
+    ]
     assert finished == [
         (
             ("exec-j6",),
