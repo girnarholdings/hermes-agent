@@ -22,6 +22,34 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
+def _make_fake_popen(captured, *, stdout="ok\n", stderr="", returncode=0):
+    """Build a subprocess.Popen stand-in that records argv/kwargs.
+
+    _run_job_script streams output through reader threads over ``proc.stdout``/
+    ``proc.stderr`` (it uses ``subprocess.Popen``, not ``subprocess.run``), so
+    the fake exposes readable text streams plus poll()/wait(). The captured
+    argv/kwargs still let callers assert interpreter/env/creationflags choices.
+    """
+    import io
+
+    class _FakeProc:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            self.pid = 4321
+            self.returncode = returncode
+            self.stdout = io.StringIO(stdout)
+            self.stderr = io.StringIO(stderr)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    return _FakeProc
+
+
 @pytest.fixture
 def cron_env(tmp_path, monkeypatch):
     """Isolated cron environment with temp HERMES_HOME."""
@@ -289,25 +317,13 @@ class TestRunJobScript:
 
         captured = {}
 
-        class FakeProc:
-            def __init__(self, argv, **kwargs):
-                captured["argv"] = argv
-                captured["kwargs"] = kwargs
-                self.returncode = 0
-
-            def poll(self):
-                return self.returncode
-
-            def communicate(self, timeout=None):
-                return ("ok\n", "")
-
-            def wait(self, timeout=None):
-                return self.returncode
-
-        fake_run = FakeProc
-
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_run)
+        # Streaming-aware Popen stand-in (see test_non_overlay_branch above):
+        # upstream's reader threads consume proc.stdout/proc.stderr/proc.pid —
+        # a poll/communicate-only fake wedges the capture loop.
+        monkeypatch.setattr(
+            sched_mod.subprocess, "Popen", _make_fake_popen(captured)
+        )
 
         success, output = _run_job_script("probe.py")
 
@@ -331,23 +347,17 @@ class TestRunJobScript:
 
         captured = {}
 
-        class FakeProc:
-            def __init__(self, argv, **kwargs):
-                captured["argv"] = argv
-                self.returncode = 0
-
-            def poll(self):
-                return self.returncode
-
-            def communicate(self, timeout=None):
-                return ("ok\n", "")
-
         monkeypatch.setattr(
             sched_mod,
             "_windows_cron_python_invocation",
             lambda python_exe: (python_exe, {}),
         )
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", FakeProc)
+        # Streaming-aware Popen stand-in: upstream's reader threads consume
+        # proc.stdout/proc.stderr/proc.pid — a poll/compile-only fake wedges
+        # the capture loop into a silent empty output.
+        monkeypatch.setattr(
+            sched_mod.subprocess, "Popen", _make_fake_popen(captured)
+        )
 
         success, output = _run_job_script("probe.py")
 

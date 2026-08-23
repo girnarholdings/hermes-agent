@@ -81,9 +81,14 @@ class TestEAGAINRecurringRedispatches:
         import cron.scheduler as sched_mod
         state = {"n": 0}
 
+        import io
+
         class _OkProc:
             def __init__(self, argv, **kwargs):
+                self.pid = 4321
                 self.returncode = 0
+                self.stdout = io.StringIO("ok\n")
+                self.stderr = io.StringIO("")
 
             def poll(self):
                 return self.returncode

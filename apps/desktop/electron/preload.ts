@@ -155,7 +155,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     setLastUsed: id => ipcRenderer.invoke('hermes:connections:set-last-used', id),
     test: id => ipcRenderer.invoke('hermes:connections:test', id),
     // Fan out `hermes update` to every eligible registered connection.
-    updateAll: () => ipcRenderer.invoke('hermes:connections:update-all'),
+    // Optional excludeIds skips rows the caller updates through another path.
+    updateAll: options => ipcRenderer.invoke('hermes:connections:update-all', options),
     // Registry lifecycle push (main → renderer): a connection was removed or
     // materially edited, so secondaries scoped to it must be disposed (and,
     // for edits, re-dialed at the new target).
@@ -195,6 +196,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     set: maxMb => ipcRenderer.invoke('hermes:data-url-read-max:set', maxMb)
   },
   readFileText: filePath => ipcRenderer.invoke('hermes:readFileText', filePath),
+  readPluginSource: (filePath: string) => ipcRenderer.invoke('hermes:readPluginSource', filePath),
   selectPaths: options => ipcRenderer.invoke('hermes:selectPaths', options),
   selectSavePath: options => ipcRenderer.invoke('hermes:selectSavePath', options),
   writeClipboard: text => ipcRenderer.invoke('hermes:writeClipboard', text),
@@ -235,6 +237,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openPreviewInBrowser: url => ipcRenderer.invoke('hermes:openPreviewInBrowser', url),
   reachPreviewUrl: url => ipcRenderer.invoke('hermes:preview:reach', url),
   fetchLinkTitle: url => ipcRenderer.invoke('hermes:fetchLinkTitle', url),
+  resolveFavicon: url => ipcRenderer.invoke('hermes:resolveFavicon', url),
   sanitizeWorkspaceCwd: cwd => ipcRenderer.invoke('hermes:workspace:sanitize', cwd),
   settings: {
     getDefaultProjectDir: () => ipcRenderer.invoke('hermes:setting:defaultProjectDir:get'),
@@ -267,6 +270,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   revealPath: targetPath => ipcRenderer.invoke('hermes:fs:reveal', targetPath),
   openDir: dirPath => ipcRenderer.invoke('hermes:fs:openDir', dirPath),
   desktopPluginsRoot: () => ipcRenderer.invoke('hermes:fs:desktopPluginsRoot'),
+  logsRoot: () => ipcRenderer.invoke('hermes:fs:logsRoot'),
   agentPluginsRoot: () => ipcRenderer.invoke('hermes:fs:agentPluginsRoot'),
   renamePath: (targetPath, newName) => ipcRenderer.invoke('hermes:fs:rename', targetPath, newName),
   writeTextFile: (filePath, content) => ipcRenderer.invoke('hermes:fs:writeText', filePath, content),

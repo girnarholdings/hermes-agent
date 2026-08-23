@@ -11,8 +11,8 @@ import os
 import sqlite3
 import threading
 import uuid
-from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -27,43 +27,59 @@ _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+def get_executions_file() -> Path:
+    """Resolve the ledger path at call time, never at import time.
+
+    HERMES_HOME can legitimately change after this module is imported:
+    pytest's hermetic fixture monkeypatches it per test, and profile
+    switches install a context-local override. A module-level constant
+    captured the pre-fixture value and sent test fixture rows into the
+    real ``~/.hermes/cron/executions.db``.
+    """
+    return get_hermes_home().resolve() / "cron" / "executions.db"
+
+
 def _connect() -> sqlite3.Connection:
-    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    path = EXECUTIONS_FILE or get_executions_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(path, timeout=5)
+    conn = sqlite3.connect(path, timeout=5)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
+            "ON executions(job_id, claimed_at DESC, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
+            "ON executions(status, claimed_at DESC, id DESC)"
+        )
+    except Exception:
+        conn.close()
+        raise
+    return conn
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
-
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    apply_wal_with_fallback(conn, db_label="cron/executions.db")
-    conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS executions (
-             id TEXT PRIMARY KEY,
-             job_id TEXT NOT NULL,
-             source TEXT NOT NULL,
-             process_id TEXT NOT NULL,
-             pid INTEGER NOT NULL,
-             process_started_at INTEGER,
-             status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
-             claimed_at TEXT NOT NULL,
-             started_at TEXT,
-             finished_at TEXT,
-             error TEXT
-           )"""
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
-        "ON executions(job_id, claimed_at DESC, id DESC)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
-        "ON executions(status, claimed_at DESC, id DESC)"
-    )
+from contextlib import contextmanager
+from typing import Iterator
 
 
 @contextmanager
@@ -72,19 +88,19 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 
     ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back
     the transaction; it does not close the connection. Relying on that alone
-    leaks a connection (and its WAL/SHM file descriptors) on every call,
-    since closing then depends on the garbage collector. Schema init runs
-    inside the ``try`` too, so a PRAGMA/DDL failure after a successful
-    ``connect()`` still closes the connection instead of leaking it.
+    leaks a connection (and its WAL/SHM file descriptors) on every call.
+    Schema init runs inside the ``try`` too, so a PRAGMA/DDL failure after
+    a successful ``connect()`` still closes the connection instead of leaking it.
     """
     with _lock:
-        conn = _connect()
+        conn = None
         try:
-            _initialize_schema(conn)
+            conn = _connect()
             with conn:
                 yield conn
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
 
 def _record(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
@@ -205,6 +221,10 @@ def recover_interrupted_executions() -> int:
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
+    # _transaction() (not a bare _connect()) so the connection is closed on
+    # every path — both upstream and the fork parent close here; a raw
+    # _connect() leaks the handle + WAL/SHM fds on every recovery sweep
+    # (#69567 regression caught by test_ledger_operations_close_every_connection).
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, process_id, pid, process_started_at FROM executions

@@ -27,13 +27,14 @@ import { ModelMenuPanel } from '@/app/shell/model-menu-panel'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { CenteredThreadSpinner } from '@/components/assistant-ui/thread/status'
 import { findGroupOfPane } from '@/components/pane-shell/tree/model'
-import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupHeaderHidden } from '@/components/pane-shell/tree/store'
+import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupTabStrip } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
+import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -110,8 +111,18 @@ function buildTileView(storedSessionId: string): SessionView {
 // tiles have no pin/delete affordance, and transcription needs no per-tile state.
 const noop = () => undefined
 
-const tileTranscribeAudio = async (audio: Blob) =>
-  (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript
+const tileTranscribeAudio = async (audio: Blob) => {
+  // Client-direct first (profile's own STT provider, no gateway audio hop);
+  // relay when the provider is not client-callable. Same ladder as the main
+  // composer's transcribeVoiceAudio.
+  const direct = await transcribeAudioClientDirect(audio)
+
+  if (direct !== null) {
+    return direct
+  }
+
+  return (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript
+}
 
 function TileChat({
   runtimeId,
@@ -560,7 +571,7 @@ export function WorkspaceTabMenu({ children }: { children: React.ReactElement })
     const group = tree ? findGroupOfPane(tree, 'workspace') : null
 
     if (group) {
-      setTreeGroupHeaderHidden(group.id, true)
+      setTreeGroupTabStrip(group.id, 'never')
     }
   }
 
@@ -616,9 +627,9 @@ export const watchSessionTiles = paneMirror<SessionTile>({
     </SessionTabMenu>
   ),
   // A tile's tab drags like a sidebar row — stack / split / drop-to-link — with
-  // its tap (activate) + double-tap (hide bar) preserved. Always takes the drag.
-  tabDrag: (storedSessionId, event, onTap, double) => {
-    startSessionDrag(tileDragPayload(storedSessionId), event, { double, onTap })
+  // its tap (activate) preserved. Always takes the drag.
+  tabDrag: (storedSessionId, event, onTap) => {
+    startSessionDrag(tileDragPayload(storedSessionId), event, { onTap })
 
     return true
   },

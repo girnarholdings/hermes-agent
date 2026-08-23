@@ -176,7 +176,9 @@ agent↔Nous wire contract lives in `docs/chronos-managed-cron-contract.md`.
 Each cron job runs in a completely fresh agent session:
 
 - No conversation history from previous runs
-- No memory of previous cron executions (unless persisted to memory/files)
+- No memory of previous cron executions (persistent memory — MEMORY.md /
+  USER.md — does load, like any other agent run, so durable preferences and
+  facts carry over; per-run conversation context does not)
 - The prompt must be self-contained — cron jobs cannot ask clarifying questions
 - The `cronjob` toolset is disabled (recursion guard)
 
@@ -213,7 +215,9 @@ The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` re
 3. **Config** — `cron.script_timeout_seconds` in `config.yaml` (read via `load_config()`)
 4. **Default** — 3600 seconds (1 hour)
 
-This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
+This timeout bounds the **pre-run script only**, not the agent. Script stdout and stderr are drained while it runs. When `cron.script_stall_timeout_seconds` is positive, a process that produces no output for that interval is terminated before the hard ceiling. An owner-only telemetry record at `cron/progress/<job-id>.json` exposes PID/start identity, heartbeat, output count, and terminal state for read-only polling; it never authorizes a retry or delivery.
+
+Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`cron.agent_inactivity_timeout_seconds`, default 600s of idle time, `0` = unlimited; legacy `HERMES_CRON_TIMEOUT` overrides it) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
 
 ### Provider Recovery
 
@@ -252,12 +256,15 @@ Most platforms also accept an optional thread/topic as a third segment: `platfor
 | WeCom | `wecom` or `wecom:<chat_id>` | Bare name delivers to WeCom |
 | BlueBubbles | `bluebubbles` or `bluebubbles:<chat_guid>` | Bare name delivers to iMessage via BlueBubbles |
 | QQ Bot | `qqbot` or `qqbot:<chat_id>` | Bare name delivers to QQ (Tencent) via Official API v2 |
+| Bot Chat | `bot-chat` or `bot-chat:<profile>` | Inject into a local profile's canonical Bot Chat (the bot responds) |
 
 Platforms in the first group have explicit, validated target syntax — named channels (`#channel`), topics/threads, room/user IDs, group IDs, or phone numbers. The remaining platforms accept the generic `platform:<chat_id>` form (the value after the colon is used verbatim as the destination ID); a bare platform name always delivers to the home channel.
 
 **Named channels** (`slack:#engineering`, `discord:#engineering`, or a friendly name like `slack:engineering`) are resolved against the channel directory the gateway builds from connected adapters, so the gateway must have discovered the channel for name resolution to succeed; raw IDs (`slack:C0123ABCD45`) always work.
 
 For **Telegram topics**, use `telegram:<chat_id>:<thread_id>` (e.g., `telegram:-1001234567890:17585`). For **Slack threads**, the third segment is the parent message's `thread_ts` (e.g., `slack:C0123ABCD45:1700000000.000100`), so it only applies when replying under an existing message.
+
+**Bot Chat** (`bot-chat`, `bot-chat:<profile>`) is a machine-local pseudo-platform, not a gateway adapter: the scheduler delivers by running `hermes [-p <profile>] chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file <tmp>` — the same lane Bot Mode agent-to-agent messages use — so the output arrives as a real inbound turn in the profile's canonical Bot Chat and the bot runs a full agent turn on it (alternation-safe by construction; this is the chat command lane, not a transcript mirror). The bare token targets the job's own profile; the named form is validated against `~/.hermes/profiles/` at create time and again at fire time, and never resolves across machines. Bot-chat targets are excluded from the `all` routing token and from delivery preflight (no gateway credentials involved). The per-delivery subprocess timeout is `cron.bot_chat_delivery_timeout_seconds` (default 600).
 
 ### Response Wrapping
 

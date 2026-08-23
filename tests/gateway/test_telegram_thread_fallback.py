@@ -724,3 +724,90 @@ async def test_thread_fallback_only_fires_once():
     # The key point: the message was delivered despite the invalid thread
 
 
+@pytest.mark.asyncio
+async def test_send_retries_retry_after_errors():
+    """Telegram flood control should back off and retry instead of failing fast."""
+    adapter = _make_adapter()
+
+    attempt = [0]
+
+    async def mock_send_message(**kwargs):
+        attempt[0] += 1
+        if attempt[0] == 1:
+            raise FakeRetryAfter(2)
+        return SimpleNamespace(message_id=300)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(chat_id="123", content="test message")
+
+    assert result.success is True
+    assert result.message_id == "300"
+    assert attempt[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_send_flood_retries_beyond_three_attempts_within_budget(monkeypatch):
+    """Flood control honors upstream's design: RetryAfter waits under the inline
+    cap (_FLOOD_INLINE_WAIT_CAP_SECS) are slept and retried within the classic
+    3-attempt budget (#91969 fail-closed only past the inline cap).
+
+    Upstream catch-up 2026-08-23: the fork's wall-clock
+    TELEGRAM_SEND_FLOOD_BUDGET_SECONDS design (retry past 3 attempts while
+    inside a 600s budget) was dropped in favor of upstream's clean loop."""
+    from plugins.platforms.telegram import adapter as tg_adapter
+
+    # Deterministic: no real sleeps.
+    async def fake_sleep(delay):
+        pass
+
+    monkeypatch.setattr(tg_adapter.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(tg_adapter.random, "uniform", lambda a, b: 0.0)
+
+    adapter = _make_adapter()
+    attempt = [0]
+
+    async def mock_send_message(**kwargs):
+        attempt[0] += 1
+        if attempt[0] <= 2:  # 2 floods x 1s (short RetryAfter) then success
+            raise FakeRetryAfter(1)
+        return SimpleNamespace(message_id=301)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(chat_id="123", content="flood then ok")
+
+    assert result.success is True
+    assert result.message_id == "301"
+    assert attempt[0] == 3  # 2 flood retries (under the 3-attempt cap) + 1 ok
+
+
+@pytest.mark.asyncio
+async def test_send_flood_gives_up_after_budget_exhausted(monkeypatch):
+    """Flood retries stop at the classic 3-attempt cap: a short RetryAfter is
+    slept and retried, but after the third attempt the send fails.
+
+    Upstream catch-up 2026-08-23: cap semantics replaced the fork's
+    wall-clock budget; RetryAfter waits past _FLOOD_INLINE_WAIT_CAP_SECS
+    fail closed immediately (#91969)."""
+    from plugins.platforms.telegram import adapter as tg_adapter
+
+    async def fake_sleep(delay):
+        pass
+
+    monkeypatch.setattr(tg_adapter.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(tg_adapter.random, "uniform", lambda a, b: 0.0)
+
+    adapter = _make_adapter()
+    attempt = [0]
+
+    async def mock_send_message(**kwargs):
+        attempt[0] += 1
+        raise FakeRetryAfter(1)  # short wait every time: sleeps, but caps at 3
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(chat_id="123", content="always flooded")
+
+    assert result.success is False
+    assert attempt[0] == 3  # attempts 1-2 sleep+retry, attempt 3 raises

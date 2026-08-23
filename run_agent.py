@@ -276,6 +276,15 @@ _MAX_TOOL_WORKERS = 8
 # (agent/transports/chat_completions.py, agent/chat_completion_helpers.py) strip
 # every top-level ``_``-prefixed key before the request leaves the process, so
 # this never reaches a strict OpenAI-compatible gateway.
+#
+# CONTRACT (#92231): the marker asserts "this dict's CONTENT is durable as
+# written". Loaded rows are stamped at materialization time
+# (hermes_state._rows_to_conversation), so any code that mutates a loaded or
+# flushed dict's content in place and needs the change persisted MUST pop the
+# marker (and invalidate _db_flush_scan_prefix if the dict may sit inside the
+# bounded-scan prefix) — see agent/turn_finalizer.py (fill-empty-tail) and
+# agent/context_compressor.py (micro-compaction defrag) for the two canonical
+# pop sites. Mutating without popping leaves the DB silently stale.
 _DB_PERSISTED_MARKER = "_db_persisted"
 
 
@@ -443,7 +452,7 @@ class AIAgent:
         command: str = None,
         args: list[str] | None = None,
         model: str = "",
-        max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        max_iterations: int = sys.maxsize,  # Default: unlimited tool-calling iterations (shared with subagents)
         tool_delay: float = None,  # Deprecated: accepted for compatibility, ignored
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -470,6 +479,7 @@ class AIAgent:
         clarify_callback: callable = None,
         read_terminal_callback: callable = None,
         read_preview_callback: callable = None,
+        drive_preview_callback: callable = None,
         read_window_below_callback: callable = None,
         setup_mcp_callback: callable = None,
         tour_callback: callable = None,
@@ -560,6 +570,7 @@ class AIAgent:
             clarify_callback=clarify_callback,
             read_terminal_callback=read_terminal_callback,
             read_preview_callback=read_preview_callback,
+            drive_preview_callback=drive_preview_callback,
             read_window_below_callback=read_window_below_callback,
             setup_mcp_callback=setup_mcp_callback,
             tour_callback=tour_callback,
@@ -1040,6 +1051,26 @@ class AIAgent:
                     threshold=threshold_tokens,
                     reason=reason,
                 )
+            )
+
+    def _warn_uncompressed_context_overflow(
+        self, preflight_tokens: int, context_length: int
+    ) -> None:
+        """Surface a deduped warning when uncompressed context exceeds model limit.
+
+        When compression is explicitly disabled (compression.enabled: false), long
+        sessions can grow past the model context window with no compression to shrink
+        them (#89297). Surface an actionable warning so the user knows to run /compact
+        or enable compression.
+        """
+        _warn_key = ("uncompressed_ctx_overflow", context_length)
+        if getattr(self, "_last_ctx_overflow_warn", None) != _warn_key:
+            self._last_ctx_overflow_warn = _warn_key
+            self._emit_warning(
+                f"⚠️ Session context (~{preflight_tokens:,} tokens) exceeds the model "
+                f"context window (~{context_length:,} tokens) with compression disabled "
+                f"(compression.enabled: false). Use /compact to compress history or "
+                f"enable compression in config.yaml."
             )
 
     def _clear_context_overflow_warn(self) -> None:
@@ -1874,22 +1905,37 @@ class AIAgent:
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
                 return
-        from agent.background_review import spawn_background_review_thread
+        from agent.background_review import (
+            finish_background_review_run,
+            prepare_background_review_run,
+            spawn_background_review_thread,
+        )
         from tools.thread_context import propagate_context_to_thread
-        target, _prompt = spawn_background_review_thread(
-            self,
-            messages_snapshot,
-            review_memory=review_memory,
-            review_skills=review_skills,
-            focus=focus,
-            task_cfg=task_cfg,
-        )
-        # Carry the active profile into the review thread so MEMORY.md / skill
-        # review writes land in the right profile (#54937).
-        t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
-        )
-        t.start()
+
+        review_run = prepare_background_review_run(self)
+        if review_run is None:
+            return
+        try:
+            target, _prompt = spawn_background_review_thread(
+                self,
+                messages_snapshot,
+                review_memory=review_memory,
+                review_skills=review_skills,
+                focus=focus,
+                task_cfg=task_cfg,
+                review_run=review_run,
+            )
+            # Carry the active profile into the review thread so MEMORY.md /
+            # skill review writes land in the right profile (#54937).
+            t = threading.Thread(
+                target=propagate_context_to_thread(target),
+                daemon=True,
+                name="bg-review",
+            )
+            t.start()
+        except Exception:
+            finish_background_review_run(self, review_run)
+            raise
 
     def _build_memory_write_metadata(
         self,
@@ -4214,7 +4260,8 @@ class AIAgent:
                 latch = self._credits_latch = new_credits_latch()
             # Free-model gate: a depleted account on a free model can still
             # inference, so the depleted error banner is suppressed. Local-data
-            # only (":free" suffix + pricing-cache peek) — never a network call.
+            # only (":free" suffix, "stealth/" prefix + pricing-cache peek) —
+            # never a network call.
             model_is_free = is_free_tier_model(
                 getattr(self, "model", "") or "",
                 getattr(self, "base_url", "") or "",
@@ -8219,6 +8266,7 @@ class AIAgent:
         function_result: str,
         *,
         failed: bool,
+        tool_call_id: str = "",
     ) -> str:
         decision = self._tool_guardrails.after_call(
             tool_name,
@@ -8226,20 +8274,36 @@ class AIAgent:
             function_result,
             failed=failed,
         )
-        # Identical-call loop breaker (agent.stall_guards): notice-only, no
+        # Identical-call stall guards (agent.stall_guards): notice-only, no
         # blocking. Observed on the RAW result (before the loop-warning suffix
         # below, whose embedded count changes per call and would defeat
-        # result-identity matching). Appended here — at result construction,
+        # result-identity matching). Applied here — at result construction,
         # before the tool message is built — so it is cache-safe (tool results
         # are append-only; nothing already sent to the provider is mutated).
         stall_notice = None
+        result_stub = None
         if self._stall_guards_enabled():
             try:
-                stall_notice = self._tool_guardrails.observe_identical_call(
-                    tool_name, function_args, function_result,
+                observation = self._tool_guardrails.observe_call(
+                    tool_name,
+                    function_args,
+                    function_result if isinstance(function_result, str) else None,
+                    tool_call_id=tool_call_id,
+                    failed=failed,
                 )
+                stall_notice = observation.notice
+                result_stub = observation.stub
             except Exception as exc:
                 logger.debug("stall-guard identical-call observation failed: %s", exc)
+        # Result-reference stubbing: a 2nd+ consecutive identical call whose
+        # FRESH result is byte-identical enters context as a short reference
+        # stub instead of the duplicate payload. The tool still executed —
+        # this is not a cache; a changed result flows through whole. Only
+        # plain-string results are stubbed (multimodal content lists pass
+        # through untouched), and the current message keeps its role and
+        # tool_call_id — only the content is replaced.
+        if result_stub and isinstance(function_result, str):
+            function_result = result_stub
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
@@ -8439,6 +8503,15 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        # A review deliberately shares this agent's session_id for prompt-cache
+        # parity. Fence review startup or interrupt an admitted request, then
+        # await that request's exit before opening any live-turn Relay or task
+        # instrumentation for the same session. Foreground priority is retained
+        # if the review does not acknowledge within the bounded deadline (#84423).
+        from agent.background_review import cancel_background_review_for_live_turn
+
+        cancel_background_review_for_live_turn(self)
+
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,

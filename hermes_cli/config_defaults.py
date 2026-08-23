@@ -43,7 +43,11 @@ DEFAULT_CONFIG = {
         "terminal_continue": True,
     },
     "agent": {
-        "max_turns": 500,
+        # Unlimited by default. The agent turn cap caused more problems than
+        # it solved (silent mid-task truncation). null = unlimited; set a
+        # positive integer to cap, or use "none"/"unlimited"/"inf"/0/-1 —
+        # all normalized by hermes_cli.config.resolve_turn_limit.
+        "max_turns": None,
         # Optional wall-clock budget in seconds per conversation run.
         # null/absent = feature fully off (zero behavior change). When set,
         # the agent gets a one-time wrap-up notice at 80% elapsed and
@@ -393,6 +397,17 @@ DEFAULT_CONFIG = {
         # window so it can't leak indefinitely. 0 disables escalation (SIGTERM
         # only — the historical behavior). Floored internally at 0.
         "daemon_term_grace_seconds": 2.0,
+        # Bounded linger (seconds) for one-shot CLI runs (-q/-Q/-z) that exit
+        # while background processes spawned with notify_on_complete=true are
+        # still running. The dying parent owns those children's stdout pipes,
+        # so exiting immediately kills the delivery a few seconds later —
+        # destroying Bot Mode handoff replies dispatched via message_agent /
+        # bot_relay from a short-lived `hermes -p <bot> chat -Q` recipient
+        # (#90879). The parent instead waits (up to this bound) for tracked
+        # notify_on_complete processes to finish before exiting. Plain
+        # background processes without notify_on_complete (servers, daemons)
+        # are never waited on. 0 disables the linger.
+        "oneshot_completion_wait_seconds": 600.0,
         # Environment variables to pass through to sandboxed execution
         # (terminal and execute_code).  Skill-declared required_environment_variables
         # are passed through automatically; this list is for non-skill use cases.
@@ -492,6 +507,26 @@ DEFAULT_CONFIG = {
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
+        # Keyless free-tier ring: with NO web backend configured or keyed,
+        # web_search/web_extract rotate round-robin across five vendors'
+        # public free tiers (exa, parallel, tavily, firecrawl, keenable),
+        # failing over to the next ring vendor on rate limits. Never
+        # pre-empts a configured or keyed backend. Set false to disable.
+        "keyless_fallback": True,
+        # One-shot keyless rescue: when the chosen/keyed backend fails a
+        # web_search/web_extract call, THAT call retries once on the keyless
+        # free-tier ring — the next call attempts the chosen backend again
+        # (no sticky failover). Off when keyless_fallback is false.
+        "keyless_rescue": True,
+        # Per-provider tier selection for ring vendors with both a keyless
+        # free endpoint and a keyed paid path (exa, parallel, tavily,
+        # firecrawl, keenable). Set by the `hermes tools` picker's
+        # "Free (keyless)" / "Paid (API key)" rows.
+        #   free  — always use the anonymous free endpoint (even with a key)
+        #   paid  — always use the keyed path (missing key = error; vendor
+        #           is also excluded from the keyless ring)
+        #   unset — auto: keyed when the API key is present, else the ring
+        "provider_tier": {},
     },
 
     "browser": {
@@ -544,6 +579,16 @@ DEFAULT_CONFIG = {
             # host alias while leaving CAMOFOX_URL itself unchanged.
             "rewrite_loopback_urls": False,
             "loopback_host_alias": "host.docker.internal",
+        },
+        # Authenticated browser-extension controller lane. When enabled, an
+        # extension that registers through the gateway can become the exact
+        # controller for a session's browser_* tools (fail-closed once bound).
+        # Local API registration additionally requires the API server bearer
+        # key. developer_mode gates the privileged capabilities
+        # (browser_cdp / browser_evaluate) — never negotiable without it.
+        "extension_control": {
+            "enabled": False,
+            "developer_mode": False,
         },
     },
 
@@ -1754,6 +1799,11 @@ DEFAULT_CONFIG = {
         "submit_mode": "direct",       # TUI: direct submits immediately; draft leaves an editable transcript
         "max_recording_seconds": 120,
         "auto_tts": False,
+        # Desktop remote clients call the profile's STT/TTS providers
+        # DIRECTLY (config + key fetched over the authenticated REST channel
+        # at voice-session start) instead of relaying audio through the
+        # gateway — lowest-hop path in both directions. false = always relay.
+        "client_direct": True,
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
         "beep_volume": 0.3,           # Beep amplitude multiplier (0.0-1.0, default keeps prior hardcoded value)
         "thinking_sound": True,       # Calm ambient bubble sound while the agent works in voice chat (volume follows beep_volume)
@@ -1853,6 +1903,10 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Periodic built-in memory review. External providers with automatic
+        # turn/session extraction can set this to 0 and keep the small local
+        # store reserved for explicit high-frequency operational facts.
+        "nudge_interval": 10,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
@@ -2881,6 +2935,16 @@ DEFAULT_CONFIG = {
         # of leaving a wedged-but-alive zombie. Set to false to disable.
         "loop_watchdog": True,
 
+        # Loop-liveness watchdog tuning (defaults mirror
+        # gateway/shutdown_watchdog.py constants). probe_interval = seconds
+        # between liveness probes; probe_timeout = seconds a probe may go
+        # unprocessed before counting as a miss; max_strikes = consecutive
+        # misses before the watchdog hard-exits 75 for a service respawn
+        # (~90-120s of sustained loop block at the defaults).
+        "loop_watchdog_probe_interval_s": 30.0,
+        "loop_watchdog_probe_timeout_s": 10.0,
+        "loop_watchdog_max_strikes": 3,
+
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the
         # gateway_routing table). Default True for backward compatibility with
@@ -2897,7 +2961,7 @@ DEFAULT_CONFIG = {
         # — whether the feature is enabled at all is the Labs toggle, never a
         # config key (decisions.md D2/D11). 0/negative falls back to the default.
         "scale_to_zero": {
-            "idle_timeout_minutes": 5,
+            "idle_timeout_minutes": 2,
         },
 
         # Auto-resume restart-loop breaker (#30719, defense-3). When the
@@ -3215,13 +3279,37 @@ DEFAULT_CONFIG = {
         "non_interactive_local_changes": "stash",
         # When `hermes update` finds the source checkout parked on a feature
         # branch (left behind by tooling or a manual checkout), switch back
-        # to the update target automatically — but only when the branch is
-        # clean and every commit on it is already merged into the target.
-        # When it is not safe, the code update is SKIPPED with a loud
-        # warning instead of pretending success (2026-08-17 incident:
-        # "✓ Code updated!" printed while the checkout stayed days behind
-        # main on a stale branch). Set false to never auto-switch.
+        # to the update target automatically whenever the working tree is
+        # clean. Committed-but-unmerged work is safe — `git checkout` never
+        # discards commits; the branch keeps them and the update prints a
+        # loud notice naming the branch and count. This keeps non-
+        # interactive updates (desktop update button, gateway /update,
+        # cron) working: they have no way to resolve a skip. Only a DIRTY
+        # tree (uncommitted changes) blocks the switch — the code update is
+        # then SKIPPED with a loud warning instead of pretending success
+        # (2026-08-17 incident: "✓ Code updated!" printed while the
+        # checkout stayed days behind main on a stale branch). Set false to
+        # never auto-switch.
         "auto_switch_parked_branch": True,
+        # HOW a clean parked branch with unmerged commits is handled:
+        #   "switch" (default)  — switch to the update target; the commits
+        #                         stay on the branch (git checkout never
+        #                         discards committed work) and a loud notice
+        #                         names the branch + count. Deterministic —
+        #                         never conflicts — so desktop/gateway/cron
+        #                         updates always land on current code.
+        #   "update_in_place"   — for a deliberately maintained custom branch
+        #                         (local patches on top of main): merge
+        #                         origin/<target> INTO the branch instead.
+        #                         The checkout never moves and local commits
+        #                         survive; a conflict stops the update
+        #                         cleanly with nothing changed. A safety tag
+        #                         (pre-update-<stamp>) is left before the
+        #                         merge. `hermes update --switch-branch`
+        #                         overrides back to the switch path for one
+        #                         run (e.g. a deep feature branch that must
+        #                         not accumulate update merge commits).
+        "parked_branch_strategy": "switch",
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example
@@ -3599,7 +3687,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 37,
+    "_config_version": 38,
 }
 
 # Optional environment variables that enhance functionality
@@ -4101,9 +4189,17 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "TAVILY_API_KEY": {
-        "description": "Tavily API key for AI-native web search and extract",
+        "description": "Tavily API key for AI-native web search and extract (optional — keyless works without it)",
         "prompt": "Tavily API key",
         "url": "https://app.tavily.com/home",
+        "tools": ["web_search", "web_extract"],
+        "password": True,
+        "category": "tool",
+    },
+    "KEENABLE_API_KEY": {
+        "description": "Keenable API key for fast independent-index web search and page fetch (optional — keyless free tier works without it)",
+        "prompt": "Keenable API key",
+        "url": "https://keenable.ai",
         "tools": ["web_search", "web_extract"],
         "password": True,
         "category": "tool",

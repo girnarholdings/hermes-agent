@@ -577,6 +577,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.adapter_runtime import AdapterFatalError
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -3043,6 +3044,13 @@ class BasePlatformAdapter(ABC):
         # through the existing retryable conflict path.
         self._platform_lock_takeover_allowed = False
         self._platform_lock_takeover_attempted = False
+        # Process-local, redacted runtime observer installed by GatewayRunner.
+        # The callback receives lifecycle names and exception *classes* only;
+        # credentials, identifiers, messages, and exception text never cross
+        # this seam.
+        self._adapter_runtime_observer: Optional[
+            Callable[[str, Optional[type[BaseException]]], None]
+        ] = None
         
         # Track active message handlers per session for interrupt support.
         # _active_sessions stores the per-session interrupt Event; _session_tasks
@@ -3224,6 +3232,7 @@ class BasePlatformAdapter(ABC):
         self,
         chat_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        chat_id: Optional[str] = None,
     ) -> bool:
         """Whether this adapter supports native streaming-draft updates.
 
@@ -3232,6 +3241,10 @@ class BasePlatformAdapter(ABC):
         same ``draft_id`` and growing text.  Adapters that implement
         ``send_draft`` should return True here for the chat types where the
         platform supports it (Telegram restricts drafts to private DMs).
+
+        ``chat_id`` lets multi-platform adapters (relay) resolve the answer
+        through the chat's own negotiated capability profile instead of the
+        primary identity's; single-platform adapters may ignore it.
 
         Default implementation returns False.  Stream consumers fall back to
         the edit-based path (``send`` + ``edit_message``) when this returns
@@ -3434,18 +3447,45 @@ class BasePlatformAdapter(ABC):
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
 
+    def set_adapter_runtime_observer(
+        self,
+        handler: Callable[[str, Optional[type[BaseException]]], None],
+    ) -> None:
+        """Install a best-effort redacted adapter-lifecycle observer."""
+        self._adapter_runtime_observer = handler
+
+    def _notify_adapter_runtime(
+        self,
+        event: str,
+        error_class: Optional[type[BaseException]] = None,
+    ) -> None:
+        observer = getattr(self, "_adapter_runtime_observer", None)
+        if observer is None:
+            return
+        try:
+            observer(event, error_class)
+        except Exception:
+            logger.debug(
+                "Adapter runtime observer failed for %s event %s",
+                self.platform.value,
+                event,
+                exc_info=True,
+            )
+
     def _mark_connected(self) -> None:
         self._running = True
         self._fatal_error_code = None
         self._fatal_error_message = None
         self._fatal_error_retryable = True
         self._write_runtime_status_safe("connected", platform_state="connected", error_code=None, error_message=None)
+        self._notify_adapter_runtime("connected")
 
     def _mark_disconnected(self) -> None:
         self._running = False
         if self.has_fatal_error:
             return
         self._write_runtime_status_safe("disconnected", platform_state="disconnected", error_code=None, error_message=None)
+        self._notify_adapter_runtime("disconnected")
 
     def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
         self._running = False
@@ -3453,6 +3493,7 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_message = message
         self._fatal_error_retryable = retryable
         self._write_runtime_status_safe("fatal", platform_state="fatal", error_code=code, error_message=message)
+        self._notify_adapter_runtime("error", AdapterFatalError)
 
     def _write_runtime_status_safe(self, context: str, **kwargs) -> None:
         """Write runtime status; log first failure per context at warning, rest at debug.
