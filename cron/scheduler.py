@@ -3151,7 +3151,7 @@ def _deliver_result(
             import re as _re
 
             token_val = None
-            for raw_line in profile_env_path.read_text(errors="replace").splitlines():
+            for raw_line in profile_env_path.read_text(encoding="utf-8", errors="replace").splitlines():
                 line = raw_line.strip()
                 if not line or line.startswith("#"):
                     continue
