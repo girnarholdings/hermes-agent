@@ -3108,6 +3108,75 @@ def _deliver_result(
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
+    # ── Profile-identity hardening for the standalone fallback (#cron-profile-delivery) ──
+    # When a multiplex-profile cron tick delivers, the tick runs under
+    # set_hermes_home_override(<profile home>) — a CONTEXT-LOCAL override that
+    # deliberately never mutates os.environ. The standalone fallback path
+    # below resolves the platform credential from the PROCESS environment,
+    # which under the gateway is the ROOT profile's token: a profile job whose
+    # live adapter is momentarily dead (network flap, CLOSE-WAIT rebuild)
+    # silently delivered through the ROOT bot — polluting the default chat
+    # with another profile's traffic. Re-resolve the token from the ACTIVE
+    # profile home's .env here so the standalone fallback can only ever speak
+    # with the owning profile's identity. No-op when no override is active.
+    _profile_home_override = None
+    try:
+        from hermes_constants import get_hermes_home_override
+
+        _profile_home_override = get_hermes_home_override()
+    except Exception:
+        _profile_home_override = None
+
+    def _profile_scoped_pconfig(base_pconfig, platform_enum):
+        """Return a copy of pconfig whose token comes from the active
+        profile home's .env when one is active and defines the platform's
+        token env var. Falls back to the passed-in config unchanged."""
+        if not _profile_home_override:
+            return base_pconfig
+        if base_pconfig is None:
+            return base_pconfig
+        try:
+            from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+            from hermes_cli.config import load_env as _load_env
+
+            env_name = PLATFORM_TOKEN_ENV_NAMES.get(platform_enum)
+            if not env_name:
+                return base_pconfig
+            profile_env_path = Path(_profile_home_override) / ".env"
+            if not profile_env_path.is_file():
+                return base_pconfig
+            # Parse the profile .env directly (scoped read; never touches
+            # os.environ, never mutates the process cache keyed on the root
+            # .env's mtime).
+            import re as _re
+
+            token_val = None
+            for raw_line in profile_env_path.read_text(errors="replace").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = _re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+                if m and m.group(1) == env_name:
+                    token_val = m.group(2).strip().strip('"').strip("'")
+                    break
+            if not token_val:
+                return base_pconfig
+            if base_pconfig.token == token_val:
+                return base_pconfig
+            import copy as _copy
+
+            scoped = _copy.copy(base_pconfig)
+            scoped.token = token_val
+            logger.info(
+                "Job '%s': standalone delivery using active profile home credential "
+                "(profile=%s, env=%s) instead of process env",
+                job.get("name", job.get("id", "?")), _profile_home_override, env_name,
+            )
+            return scoped
+        except Exception:
+            # Hardening must never break delivery: fall back to the original.
+            return base_pconfig
+
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
@@ -3950,7 +4019,7 @@ def _deliver_result(
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, _profile_scoped_pconfig(pconfig, platform), chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3979,7 +4048,7 @@ def _deliver_result(
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, _profile_scoped_pconfig(pconfig, platform), chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
