@@ -40,6 +40,40 @@ _SILENCE_NARRATION = re.compile(
 )
 
 
+# Language-slip detection for the outbound language gate. The operator runs an
+# English-only conversation; GLM-family models carry a strong Chinese prior and
+# have been observed code-switching to Chinese mid-report under heavy context
+# (2026-08-24 incident). This is a *ratio* detector, not a ban on any CJK
+# character: legitimate content (tickers aside) almost never needs dozens of
+# CJK codepoints, while a language-slipped reply is dominated by them.
+_CJK_RANGES = (
+    (0x4E00, 0x9FFF),    # CJK Unified Ideographs (incl. the leaked hanzi)
+    (0x3400, 0x4DBF),    # Extension A
+    (0xF900, 0xFAFF),    # Compatibility Ideographs
+    (0x3040, 0x30FF),    # Hiragana + Katakana
+    (0xAC00, 0xD7AF),    # Hangul
+)
+
+
+def _cjk_codepoint_ratio(content: str) -> float:
+    """Fraction of alphanumeric-and-beyond codepoints that fall in CJK blocks."""
+    if not content:
+        return 0.0
+    total = 0
+    cjk = 0
+    for ch in content:
+        if ch.isalnum():
+            total += 1
+            cp = ord(ch)
+            for lo, hi in _CJK_RANGES:
+                if lo <= cp <= hi:
+                    cjk += 1
+                    break
+    if total == 0:
+        return 0.0
+    return cjk / total
+
+
 def _is_silence_narration(content: Optional[str]) -> bool:
     """Return True when ``content`` is *only* a silence-narration token.
 
@@ -457,6 +491,41 @@ class DeliveryRouter:
             return env.strip().lower() in ("1", "true", "yes", "on")
         return bool(getattr(self.config, "filter_silence_narration", True))
 
+    def _language_gate_enabled(self) -> bool:
+        """Whether the outbound English-only language gate is active.
+
+        ``HERMES_LANGUAGE_GATE`` env var overrides config when set; otherwise
+        the ``gateway.language_gate`` config flag wins (default True).
+        """
+        env = os.getenv("HERMES_LANGUAGE_GATE")
+        if env is not None:
+            return env.strip().lower() in ("1", "true", "yes", "on")
+        return bool(getattr(self.config, "language_gate", True))
+
+    def _apply_language_gate(
+        self, content: str
+    ) -> tuple[str, Optional[float]]:
+        """Return ``(gated_content, cjk_ratio)`` for an outbound message.
+
+        A language-slipped reply (dominated by CJK codepoints) is replaced by a
+        compact English notice that asks the operator to re-request — the
+        underlying content is *not* silently dropped (unlike silence narration,
+        it represents real work), but the non-English tokens never reach the
+        chat. Returns the original content untouched when healthy.
+        """
+        if not content:
+            return content, None
+        ratio = _cjk_codepoint_ratio(content)
+        if ratio < 0.10:  # English prose with an incidental hanzi never trips
+            return content, ratio
+        return (
+            "⚠️ Reply suppressed by language gate: the model's draft was "
+            f"{ratio:.0%} CJK (non-English) — outside this chat's English-only "
+            "contract. Re-ask and it will regenerate in English. "
+            f"(Original length: {len(content)} chars)",
+            ratio,
+        )
+
     async def _deliver_to_platform(
         self,
         target: DeliveryTarget,
@@ -542,6 +611,25 @@ class DeliveryRouter:
                 "filtered": "silence_narration",
                 "delivered": False,
             }
+
+        # Language gate (2026-08-24 incident: GLM-family Chinese code-switch
+        # under heavy context). Same chokepoint rationale as silence narration:
+        # one filter covers every adapter and every persona prompt. Unlike
+        # silence narration the gated message is still DELIVERED — as a short
+        # English notice — because the suppressed draft represents real work;
+        # only the non-English tokens are stopped from reaching the chat.
+        if self._language_gate_enabled():
+            gated, cjk_ratio = self._apply_language_gate(content)
+            if gated is not content:
+                logger.warning(
+                    "Language gate rewrote outbound to %s (chat=%s): "
+                    "CJK ratio %.2f, original %d chars",
+                    target.platform.value,
+                    target.chat_id,
+                    cjk_ratio or 0.0,
+                    len(content or ""),
+                )
+                content = gated
 
         send_metadata = dict(metadata or {})
         if transport.is_relay:
