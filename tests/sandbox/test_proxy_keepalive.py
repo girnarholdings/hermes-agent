@@ -56,15 +56,23 @@ class Env:
         script = root / 'proxy_test.py'
         script.write_text(src)
         # upstream origin server (the "real internet" behind the proxy)
-        # TLS upstream (like the real internet): cert signed by the "real" CA
+        # TLS upstream (like the real internet): cert signed by the "real" CA.
+        # protocol_version=HTTP/1.1 makes the origin KEEP ALIVE — the sandbox
+        # proxy's tunnel pump stays up as long as both peers want it, and the
+        # keep-alive test asserts a second request rides the SAME tunnel, which
+        # requires an origin that does not close after the first response.
         ossl('req', '-new', '-newkey', 'rsa:2048', '-nodes',
              '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
              '-keyout', str(certs / 'up.key'), '-out', str(certs / 'up.csr'))
         ossl('x509', '-req', '-days', '2', '-in', str(certs / 'up.csr'),
-             '-CA', str(certs / 'real-ca.pem') if False else str(certs / 'ca.pem'),
+             '-CA', str(certs / 'ca.pem'),
              '-CAkey', str(certs / 'ca.key'), '-CAcreateserial',
              '-copy_extensions', 'copy', '-out', str(certs / 'up.pem'))
-        self.upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler)
+
+        class KeepAliveHandler(http.server.SimpleHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+        self.upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), KeepAliveHandler)
         import ssl as _ssl
         ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(certs / 'up.pem'), str(certs / 'up.key'))
