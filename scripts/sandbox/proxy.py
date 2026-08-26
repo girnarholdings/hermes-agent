@@ -305,10 +305,12 @@ def serve_one(conn, request, target):
 def handle_connect(conn, target):
     """Intercept a CONNECT tunnel, terminating TLS with a minted cert.
 
-    Serves AS MANY requests as the client sends on this TLS connection
-    (keep-alive), one fresh upstream exchange per request, until the client
-    closes. Each upstream request is sent with ``Connection: close`` so the
-    response ends at upstream EOF — a clean framing the relay can forward.
+    Reads the FIRST request to check for a fixture; everything else is
+    handed to forward_https, whose transparent pump OWNS the tunnel from
+    then on — it reads subsequent requests off the same TLS connection
+    itself. Do NOT loop here: a second read_request on the tunnel would
+    race the pump's client->upstream reader for the same socket (the
+    2026-08-26 curl: (52) failure class).
     """
     host, _, port_text = target.rpartition(':')
     port = int(port_text or '443')
@@ -317,17 +319,16 @@ def handle_connect(conn, target):
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
     with context.wrap_socket(conn, server_side=True) as tls:
-        while True:
-            nested = read_request(tls)
-            if not nested:
-                return
-            line = nested.split(b'\r\n', 1)[0].decode('iso-8859-1')
-            nested_target = line.split(' ', 2)[1]
-            found = file_for(host, nested_target)
-            if found is not None:
-                respond_fixture(tls, found)
-            else:
-                forward_https(tls, host, port, nested)
+        nested = read_request(tls)
+        if not nested:
+            return
+        line = nested.split(b'\r\n', 1)[0].decode('iso-8859-1')
+        nested_target = line.split(' ', 2)[1]
+        found = file_for(host, nested_target)
+        if found is not None:
+            respond_fixture(tls, found)
+        else:
+            forward_https(tls, host, port, nested)
 
 
 def host_from_headers(request):
