@@ -226,8 +226,10 @@ def forward_https(conn, host, port, request):
         try:
             raw = socket.create_connection((host, port), timeout=UPSTREAM_IDLE_SECONDS)
             upstream = context.wrap_socket(raw, server_hostname=host)
+            print(f'[pump] {host}:{port} upstream connected attempt={attempt}', file=sys.stderr, flush=True)
             break
-        except OSError:
+        except OSError as err:
+            print(f'[pump] {host}:{port} connect failed attempt={attempt}: {err!r}', file=sys.stderr, flush=True)
             if attempt == 2:
                 return
             time.sleep(1)
@@ -240,8 +242,8 @@ def forward_https(conn, host, port, request):
                 if not req:
                     break
                 upstream.sendall(strip_proxy_headers(req))
-        except OSError:
-            pass
+        except OSError as err:
+            print(f'[pump] {host}:{port} c2u error: {err!r}', file=sys.stderr, flush=True)
         finally:
             try:
                 upstream.shutdown(socket.SHUT_WR)
@@ -254,10 +256,11 @@ def forward_https(conn, host, port, request):
         while True:
             chunk = upstream.recv(65536)
             if not chunk:
+                print(f'[pump] {host}:{port} upstream EOF (no more bytes)', file=sys.stderr, flush=True)
                 break
             conn.sendall(chunk)
-    except OSError:
-        pass
+    except OSError as err:
+        print(f'[pump] {host}:{port} relay error: {err!r}', file=sys.stderr, flush=True)
     finally:
         try:
             conn.shutdown(socket.SHUT_WR)
