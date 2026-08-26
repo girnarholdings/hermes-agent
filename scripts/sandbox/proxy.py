@@ -36,6 +36,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 from urllib.parse import unquote, urlsplit
 
 ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
@@ -43,8 +44,20 @@ ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
 LISTEN_ADDRESS = ('127.0.0.1', 8080)
 MAX_REQUEST_BYTES = 65536
 MAX_BODY_BYTES = 32 * 1024 * 1024
-UPSTREAM_TIMEOUT_SECONDS = 30
+# Cap on a single upstream connect; generous because it also bounds the idle
+# time between keep-alive requests on a reused connection.
+UPSTREAM_IDLE_SECONDS = 30
 CERT_VALIDITY_DAYS = 2
+
+
+def strip_proxy_headers(request):
+    """Drop hop-by-hop proxy headers from an inner (tunneled) request."""
+    headers, separator, body = request.partition(b'\r\n\r\n')
+    lines = [
+        line for line in headers.split(b'\r\n')
+        if not line.lower().startswith(b'proxy-')
+    ]
+    return b'\r\n'.join(lines) + separator + body
 
 
 def read_request(conn):
@@ -192,11 +205,66 @@ def relay(source, destination):
 
 
 def forward_https(conn, host, port, request):
+    """Forward a tunneled HTTPS request by PUMPING BYTES, not re-framing.
+
+    One real TLS connection to the host; two pumps run concurrently:
+    client->upstream (new requests) and upstream->client (responses). Each
+    ends when its peer EOFs or errors; when either side finishes, the whole
+    tunnel tears down. This replaced an intercept-and-reframe design that
+    stalled under npm's parallel registry traffic: re-framing a response
+    requires knowing where it ENDS (Content-Length/chunked parsing), and
+    upstream keep-alive meant no EOF ever arrived to delimit it.
+
+    A transient upstream connect/TLS failure looks like "empty reply" to the
+    client, which reads as a broken installer rather than a network blip, so
+    the handshake is retried a few times before giving up on this tunnel.
+    (Design adopted from upstream PR #94746.)
+    """
     context = ssl.create_default_context(cafile=str(REAL_CA))
-    with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as raw:
-        with context.wrap_socket(raw, server_hostname=host) as upstream:
-            upstream.sendall(close_request(request))
-            relay(upstream, conn)
+    upstream = None
+    for attempt in range(3):
+        try:
+            raw = socket.create_connection((host, port), timeout=UPSTREAM_IDLE_SECONDS)
+            upstream = context.wrap_socket(raw, server_hostname=host)
+            break
+        except OSError:
+            if attempt == 2:
+                return
+            time.sleep(1)
+
+    def c2u():
+        try:
+            upstream.sendall(strip_proxy_headers(request))
+            while True:
+                req = read_request(conn)
+                if not req:
+                    break
+                upstream.sendall(strip_proxy_headers(req))
+        except OSError:
+            pass
+        finally:
+            try:
+                upstream.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    t = threading.Thread(target=c2u, daemon=True)
+    t.start()
+    try:
+        while True:
+            chunk = upstream.recv(65536)
+            if not chunk:
+                break
+            conn.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        t.join(timeout=5)
+        upstream.close()
 
 
 def forward_http(conn, host, port, request, target):
@@ -204,7 +272,7 @@ def forward_http(conn, host, port, request, target):
     path = parsed.path or '/'
     if parsed.query:
         path += f'?{parsed.query}'
-    with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as upstream:
+    with socket.create_connection((host, port), timeout=UPSTREAM_IDLE_SECONDS) as upstream:
         upstream.sendall(close_request(request, path))
         relay(upstream, conn)
 
