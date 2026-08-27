@@ -3042,6 +3042,82 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _outbox_retryable(error_text: str) -> bool:
+    """Is this delivery failure a channel outage worth queueing?"""
+    try:
+        from cron.delivery_outbox import is_retryable_delivery_failure
+    except Exception:  # noqa: BLE001 — never let outbox import break delivery
+        return False
+    return is_retryable_delivery_failure(error_text or "")
+
+
+def _outbox_enqueue(job: dict, content: str, media_files) -> None:
+    """Park a failed delivery in the outbox (best-effort, never raises)."""
+    try:
+        from cron.delivery_outbox import enqueue
+
+        targets = _resolve_delivery_targets(job) or []
+        target = (
+            f"{targets[0].get('platform', 'telegram')}:{targets[0].get('chat_id', '')}"
+            if targets
+            else "telegram:7198242672"
+        )
+        enqueue(
+            job_id=job.get("id", "unknown"),
+            job_name=job.get("name", ""),
+            target=target,
+            content=content or "",
+            media_files=list(media_files or []),
+        )
+    except Exception:  # noqa: BLE001 — queueing must never break the run path
+        logger.exception("delivery outbox: enqueue failed for job %s", job.get("id"))
+
+
+def _outbox_drain(adapters=None, loop=None) -> int:
+    """Redeliver queued outbox messages, standalone-path style.
+
+    Reuses _deliver_result's standalone fallback shape (fresh asyncio.run,
+    profile-scoped pconfig) via a minimal single-target send. Best-effort:
+    never raises into the tick.
+    """
+    try:
+        from cron.delivery_outbox import drain, pending_count
+
+        if not pending_count():
+            return 0
+        from tools.send_message_tool import _send_to_platform
+        from gateway.config import load_gateway_config, Platform
+        import asyncio as _asyncio
+
+        cfg = load_gateway_config()
+
+        def _pconfig_for(platform_name: str):
+            try:
+                platform = Platform(platform_name)
+            except ValueError:
+                return None
+            return getattr(cfg.platforms, platform_name, None) or getattr(
+                cfg, "platform_config", {}
+            ).get(platform) if hasattr(cfg, "platform_config") else None
+
+        def _send(target: str, content: str, media_files):
+            platform_name, _, chat_id = target.partition(":")
+            coro = _send_to_platform(
+                Platform(platform_name),
+                _pconfig_for(platform_name),
+                chat_id,
+                content,
+                thread_id=None,
+                media_files=media_files or None,
+            )
+            return bool(_asyncio.run(coro))
+
+        return drain(_send)
+    except Exception:  # noqa: BLE001 — drain must never break the tick
+        logger.exception("delivery outbox: drain failed")
+        return 0
+
+
 def _deliver_result(
     job: dict,
     content: str,
@@ -7740,6 +7816,14 @@ def _run_one_job_body(
                             deliver_content,
                             **deliver_kwargs,
                         )
+                        if delivery_error and _outbox_retryable(delivery_error):
+                            # Channel outage (send_path_degraded / Timed out /
+                            # network error): park the message in the delivery
+                            # outbox instead of losing it. The next healthy
+                            # tick drains FIFO (#channel-queue 2026-08-26).
+                            _outbox_enqueue(
+                                job, deliver_content, deliver_kwargs.get("media_files"),
+                            )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
                         raise
@@ -7755,6 +7839,8 @@ def _run_one_job_body(
                         retry_allowed = isinstance(de, DeliveryReceiptRetryable)
                         if not isinstance(de, DeliveryReceiptError):
                             retry_allowed = False
+                    if _outbox_retryable(delivery_error):
+                        _outbox_enqueue(job, deliver_content, None)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
             elif _delivery_evidence:
                 success = False
@@ -7911,6 +7997,15 @@ def _run_one_job_body(
                     adapters=adapters,
                     loop=loop,
                 )
+                if delivery_error and _outbox_retryable(delivery_error):
+                    # Channel outage — park the failure alert in the delivery
+                    # outbox; a later healthy tick redelivers (#channel-queue).
+                    _outbox_enqueue(
+                        job,
+                        _summarize_cron_failure_for_delivery(job, _err_text)
+                        + _failure_streak_nudge(job),
+                        None,
+                    )
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)
                 logger.error(
@@ -8069,6 +8164,13 @@ def tick(
     # lock": that previously made the scheduler appear healthy (tick returned
     # 0, heartbeat recorded success) while no job ever ran again (#87644).
     lock_fd = None
+    # Delivery outbox drain: redeliver messages queued by a channel outage
+    # before dispatching new jobs, so a recovering channel flushes its
+    # backlog first (FIFO, bounded batch). Best-effort, never breaks tick.
+    try:
+        _outbox_drain(adapters=adapters, loop=loop)
+    except Exception:  # noqa: BLE001
+        logger.exception("delivery outbox drain crashed; continuing tick")
     try:
         lock_fd = open(lock_file, "w", encoding="utf-8")
         if fcntl:
