@@ -185,12 +185,24 @@ class TestRunJobScript:
 
         captured = {}
 
+        class FakeStream:
+            def __init__(self, chunks):
+                self._iter = iter(chunks)
+
+            def readline(self):
+                return next(self._iter, "")
+
+            def close(self):
+                pass
+
         class FakeProc:
             def __init__(self, argv, **kwargs):
                 captured["argv"] = argv
                 captured["kwargs"] = kwargs
                 self.pid = 4242
                 self.returncode = 0
+                self.stdout = FakeStream(["ok\n"])
+                self.stderr = FakeStream([])
 
             def poll(self):
                 return self.returncode
