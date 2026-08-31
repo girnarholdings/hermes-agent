@@ -189,6 +189,7 @@ class TestRunJobScript:
             def __init__(self, argv, **kwargs):
                 captured["argv"] = argv
                 captured["kwargs"] = kwargs
+                self.pid = 4242
                 self.returncode = 0
 
             def poll(self):
