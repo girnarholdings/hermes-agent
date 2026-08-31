@@ -3086,7 +3086,8 @@ def _outbox_drain(adapters=None, loop=None) -> int:
         if not pending_count():
             return 0
         from tools.send_message_tool import _send_to_platform
-        from gateway.config import load_gateway_config, Platform
+        from gateway.config import load_gateway_config, Platform, PLATFORM_TOKEN_ENV_NAMES
+        from hermes_constants import get_hermes_home_override
         import asyncio as _asyncio
 
         cfg = load_gateway_config()
@@ -3096,9 +3097,41 @@ def _outbox_drain(adapters=None, loop=None) -> int:
                 platform = Platform(platform_name)
             except ValueError:
                 return None
-            return getattr(cfg.platforms, platform_name, None) or getattr(
-                cfg, "platform_config", {}
-            ).get(platform) if hasattr(cfg, "platform_config") else None
+            # cfg.platforms is a Dict[Platform, PlatformConfig] — attribute
+            # access always returned None (the 47k-error 'NoneType' object has
+            # no attribute 'token' drain crash-loop, 2026-08-31). Dict lookup,
+            # then resolve the bot token from the ACTIVE PROFILE's .env the
+            # same way _profile_scoped_pconfig does — per the multiplexer the
+            # owning profile's bot identity is the delivery channel, and the
+            # root gateway config no longer carries platform tokens.
+            pconfig = cfg.platforms.get(platform) if hasattr(cfg.platforms, "get") else None
+            if pconfig is None:
+                return None
+            token_env = PLATFORM_TOKEN_ENV_NAMES.get(platform)
+            if not token_env:
+                return pconfig
+            profile_home = get_hermes_home_override()
+            token_val = None
+            if profile_home:
+                env_path = Path(profile_home) / ".env"
+                if env_path.is_file():
+                    import re as _re
+                    for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                        line = raw_line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        m = _re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+                        if m and m.group(1) == token_env:
+                            token_val = m.group(2).strip().strip('"').strip("'")
+                            break
+            if not token_val and os.environ.get(token_env):
+                token_val = os.environ[token_env]
+            if not token_val:
+                return pconfig  # token stays None; _send_to_platform will fail loudly upstream
+            import copy as _copy
+            scoped = _copy.copy(pconfig)
+            scoped.token = token_val
+            return scoped
 
         def _send(target: str, content: str, media_files):
             platform_name, _, chat_id = target.partition(":")
