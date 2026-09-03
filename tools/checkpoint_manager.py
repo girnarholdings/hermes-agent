@@ -202,6 +202,28 @@ def _normalize_path(path_value: str) -> Path:
     return Path(path_value).expanduser().resolve()
 
 
+def _is_system_scratch_root(abs_dir: str) -> bool:
+    """True when ``abs_dir`` is a system scratch root that must never be
+    checkpointed as a project workdir.
+
+    Covers the FHS world-writable sticky roots (``/tmp``, ``/var/tmp``,
+    ``/run``, ``/dev/shm``) plus the user runtime dir (``/run/user/<uid>``,
+    resolved).  A checkpoint on such a root makes ``git add -A`` walk every
+    user's scratch files — including mode-600 files owned by other users
+    (ollama, systemd-private dirs) — which fails rc=128 and, at shutdown,
+    wedges gateway restart.  Override for tests via
+    ``HERMES_CHECKPOINT_ALLOW_SCRATCH_ROOTS=1``.
+    """
+    if os.environ.get("HERMES_CHECKPOINT_ALLOW_SCRATCH_ROOTS") == "1":
+        return False
+    _hard = {"/tmp", "/var/tmp", "/run", "/dev/shm"}
+    try:
+        _user_runtime = str(Path(os.environ.get("XDG_RUNTIME_DIR", "/run/user")).resolve())
+    except OSError:
+        _user_runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user")
+    return abs_dir in _hard or abs_dir == _user_runtime
+
+
 def _project_hash(working_dir: str) -> str:
     """Deterministic per-project hash: sha256(abs_path)[:16]."""
     abs_path = str(_normalize_path(working_dir))
@@ -914,6 +936,19 @@ class CheckpointManager:
         # Skip root, home, and other overly broad directories
         if abs_dir in {"/", str(Path.home())}:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
+            return False
+
+        # Skip system scratch roots (2026-09-02: a session with workdir /tmp
+        # made every checkpoint `git add -A` scan all of /tmp — unreadable
+        # ollama/systemd-private files → rc=128, and the shutdown checkpoint
+        # wedged gateway restarts for the full 5m30s stop-timeout).
+        # World-writable sticky roots hold other users' private files; they
+        # are never a legitimate project root for snapshotting.
+        if _is_system_scratch_root(abs_dir):
+            logger.warning(
+                "Checkpoint skipped: system scratch root not checkpointable (%s)",
+                abs_dir,
+            )
             return False
 
         if abs_dir in self._checkpointed_dirs:

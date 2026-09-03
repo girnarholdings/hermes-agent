@@ -160,6 +160,15 @@ class TestTakeCheckpoint:
         assert mgr.ensure_checkpoint("/", "root") is False
         assert mgr.ensure_checkpoint(str(Path.home()), "home") is False
 
+    def test_never_checkpoints_system_scratch_roots(self, mgr, work_dir):
+        # 2026-09-02 regression: a session with workdir /tmp made every
+        # checkpoint `git add -A` walk all of /tmp (unreadable ollama /
+        # systemd-private files → rc=128; shutdown checkpoint wedged
+        # gateway restarts for the full stop-timeout).
+        os.environ.pop("HERMES_CHECKPOINT_ALLOW_SCRATCH_ROOTS", None)
+        for scratch in ("/tmp", "/var/tmp", "/run", "/dev/shm"):
+            assert mgr.ensure_checkpoint(scratch, "scratch") is False, scratch
+
     def test_new_turn_resets_dedup_but_needs_changes(self, mgr, work_dir):
         assert mgr.ensure_checkpoint(str(work_dir), "turn 1") is True
         mgr.new_turn()
